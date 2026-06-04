@@ -45,6 +45,11 @@ class RocmBackend(BaseBackend):
             bin_cli_opts.append(f"--amdgpu-waves-per-eu={waves_per_eu}")
         if maxnreg:
             bin_cli_opts.append(f"--amdgpu-num-vgpr={maxnreg}")
+        import os as _os
+
+        _extra = _os.environ.get("FLYDSL_EXTRA_LLC_OPTS", "").strip()
+        if _extra:
+            bin_cli_opts.extend(_extra.split())
 
         rocdl_opts = {
             "O": 2,
