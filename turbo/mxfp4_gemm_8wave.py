@@ -631,6 +631,16 @@ def compile_mxfp4_gemm_8w(
     # the combined-adjacent B trick.
     A_NARROW = LDS_BLOCK_M < _ROWS_PER_STEP
     NW_A_ACTIVE = LDS_BLOCK_M // 16  # 16 A rows per wave
+    # B11 (r_a1, round-57): when the FULL A tile is exactly one combined G2S step
+    # (BLOCK_M == _ROWS_PER_STEP, i.e. BM128: LDS_BLOCK_M=64 -> a_lds0+a_lds1=128
+    # rows = one step), mirror the BN128 B combined-128 trick: ONE 128-row G2S over
+    # the LDS-adjacent a_lds0+a_lds1 fills both halves with ALL 8 waves doing useful
+    # work — eliminating the clamp-wave narrow path's 4/8 redundant waves (50% A VMEM
+    # waste) and halving the A-G2S issue count. BM192 (BLOCK_M=192!=128) stays the
+    # clamp-wave narrow path. Staged-only this round (correctness vehicle); pipe port
+    # is r_a2 (needs the merged-spill wait tuning like B's r_k7).
+    A_COMBINE = A_NARROW and (BLOCK_M == _ROWS_PER_STEP)
+    N_LDS_STEPS_A_FULL = BLOCK_M // _ROWS_PER_STEP  # 1 for BM128
     # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
     # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
     LDS_ROW_STRIDE = BPR + (pad_bytes if padded else 0)
@@ -686,6 +696,12 @@ def compile_mxfp4_gemm_8w(
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
+            # B11 (r_a1): combined-128 A loader (all 8 waves, fills LDS-adjacent
+            # a_lds0+a_lds1 in one step). Mirror of b_g2s_full. Only built/used when
+            # A_COMBINE (BM128). Replaces the clamp-wave narrow path's redundant waves.
+            if const_expr(A_COMBINE):
+                gl_off_a_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A_FULL, BPR)
+                a_g2s_full = G2SLoader(a_div, gl_off_a_full, N_LDS_STEPS_A_FULL, F8_IR_t, wave_id)
             # B4 narrow-B G2S (BLOCK_N < step): one combined G2S step where the
             # wave index is clamped to [0, NW_B_ACTIVE-1]. Waves >= NW_B_ACTIVE
             # redundantly reload the last valid 16-row region (same gmem src + same
@@ -734,7 +750,11 @@ def compile_mxfp4_gemm_8w(
         c11 = [mfma.zero_value] * N_ACCUMS
 
         for k in range_constexpr(K_ITERS):
-            if const_expr(A_NARROW and not padded):
+            if const_expr(A_COMBINE and not padded):
+                # B11 (r_a1): combined-128 A — one 128-row G2S fills LDS-adjacent
+                # a_lds0(0..63)+a_lds1(64..127), all 8 waves useful (no redundancy).
+                a_g2s_full.load(a_lds0, A0_off + k * KSTEP)
+            elif const_expr(A_NARROW and not padded):
                 # B6 BM192: clamp-wave combined G2S per 96-row A region.
                 a_g2s_narrow.load(a_lds0, A0_off + k * KSTEP)
                 a_g2s_narrow.load(a_lds1, A1_off + k * KSTEP)
