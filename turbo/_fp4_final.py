@@ -53,7 +53,7 @@ def ascale(asc, M, K, BM):
     return preshuffle_scale(asc, K, nta).view(-1)
 
 
-def one(M, N, K, BM, BN, gm, gn, inp):
+def one(M, N, K, BM, BN, gm, gn, inp, nx=8):
     ai, bi, asc, bsc = inp
     asp = ascale(asc, M, K, BM)
     # B-scale format follows the chosen BLOCK_N: comb (4-scale dwordx4) for BN256,
@@ -62,7 +62,7 @@ def one(M, N, K, BM, BN, gm, gn, inp):
            else preshuffle_scale(bsc, K, BN // 128)).view(-1)
     c = torch.zeros((M, N), dtype=torch.bfloat16, device="cuda")
     st = torch.cuda.current_stream()
-    fn = compile_mxfp4_gemm_8w(K=K, BLOCK_M=BM, BLOCK_N=BN, mode="pipe", group_m=gm, group_n=gn)
+    fn = compile_mxfp4_gemm_8w(K=K, BLOCK_M=BM, BLOCK_N=BN, mode="pipe", group_m=gm, group_n=gn, num_xcds=nx)
     ar = (ai, bi, c.view(-1), asp, bsp, M, N, st)
     cc = flyc.compile(fn, *ar); cc(*ar); torch.cuda.synchronize()
     out1 = c.clone()
@@ -85,9 +85,9 @@ for M in (4096, 8192):
     print(f"--- M={M} ---")
     for tag, N, K in SHAPES:
         inp = make(M, N, K)
-        BM, BN, gm, gn = recommend_config(M, N, K)
+        BM, BN, gm, gn, nx = recommend_config(M, N, K)
         tfb, refb, detb = one(M, N, K, 256, 256, 4, 0, inp)
-        tfr, outr, detr = one(M, N, K, BM, BN, gm, gn, inp)
+        tfr, outr, detr = one(M, N, K, BM, BN, gm, gn, inp, nx=nx)
         s = snr(outr, refb)
         win = (tfr / tfb - 1) * 100
         worst_win = min(worst_win, win)

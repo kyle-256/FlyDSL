@@ -252,7 +252,7 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
 def recommend_config(M, N, K):
     """Data-driven production config for dense mxfp4 (mode=pipe) on MI355X.
 
-    Returns (BLOCK_M, BLOCK_N, group_m, group_n). Three verified-solid levers:
+    Returns (BLOCK_M, BLOCK_N, group_m, group_n, num_xcds). Verified-solid levers:
 
     - BLOCK_N = 128 for grid-underfilled (narrow-N kv) shapes: when the BLOCK_N=256
       grid has fewer tiles than the 256 active CUs, halving N doubles the N-tiles and
@@ -292,11 +292,19 @@ def recommend_config(M, N, K):
     # shapes; square/q-o (K<=8192) stay gn0 (joint sweep confirmed noise there).
     # round-76 (aligned nx x gn joint sweep, GOLD T=15 fresh-data interleaved): the
     # "down" (K>>N) regime wants an ABSOLUTE band width ~4, not nb//8. 7B down
-    # (nb=16) nb//8=2 -> gn=4 confirmed +1.0%/+1.5% (M4096/M8192, 15/15 both); 70B
-    # down (nb=32) already nb//8=4 (byte-identical). big-N (nb>=96) keeps nb//8 (=14
-    # for 70B gate/up, #bands=#XCD). r61's nb//8 down rule under-set 7B down's band.
+    # (nb=16) nb//8=2 -> gn=4 confirmed +1.0%/+1.5% (M4096/M8192, 15/15 both).
+    # round-77 (same GOLD sweep): 70B down (nb=32, K=28672) wants the ALIGNED
+    # (num_xcds=16, group_n=2) = 16 narrow bands, NOT (nx8,gn4): GOLD +1.2%/+0.8%
+    # (15/15 both M). This is a genuine JOINT-nx lever — the mis-aligned (nx8,gn2)
+    # LOSES -5.8%, so gn=2 is ONLY a win paired with nx=16 (#bands==num_xcds keeps
+    # each XCD's pid-block on one N-band). big-N (nb>=96) keeps nb//8=14 / nx8.
+    # num_xcds default 8 = physical XCD count (r38/r56); only 70B down overrides to 16.
+    num_xcds = 8
     if nb >= 96:
         group_n = nb // 8
+    elif K >= 28672:
+        group_n = 2
+        num_xcds = 16
     elif K >= 11008:
         group_n = 4
     else:
@@ -332,7 +340,7 @@ def recommend_config(M, N, K):
     # permutation (bit-exact, det-neutral). kv M8192 stays BM256/gm2 (r26, unchanged).
     if block_m == 128:
         group_m = 8
-    return block_m, block_n, group_m, group_n
+    return block_m, block_n, group_m, group_n, num_xcds
 
 
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
