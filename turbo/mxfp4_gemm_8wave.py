@@ -278,12 +278,20 @@ def recommend_config(M, N, K):
       is run-to-run noise; the band group_n lever owns their L2 locality).
     """
     NUM_CUS = 256
-    block_m = 256
     tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
     block_n = 128 if tiles_256 < NUM_CUS else 256
     nb = N // block_n
     group_n = nb // 8 if nb >= 96 else 0
     group_m = 2 if block_n == 128 else 4
+    # B6 (r6_4): BLOCK_M=192 for the grid-underfilled kv regime where the BM256/BN128
+    # grid still leaves CUs idle. ceil(M/256)*ceil(N/128) WG at BM256: kv M4096=128wg
+    # (<256, half the CUs idle); BM192 -> 22 M-tiles vs 16 = 176wg at 0.75x per-WG MFMA
+    # -> +6.0% (r6_3 interleaved 10/10, det0, pipe narrow-A-G2S SNR 336dB). kv M8192 is
+    # already 256wg-full at BM256 -> BM192 (344wg) overshoots & regresses -18%, so gate
+    # on the underfill. NOT the discredited BLOCK_M=128 (that raced); BM192 is the
+    # quadrant's smallest correct M-tile (N_TILES_A=3, narrow-A-G2S clamp-wave).
+    wg_bm256 = ((M + 255) // 256) * ((N + block_n - 1) // block_n)
+    block_m = 192 if (block_n == 128 and wg_bm256 < NUM_CUS) else 256
     return block_m, block_n, group_m, group_n
 
 

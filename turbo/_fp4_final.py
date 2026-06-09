@@ -36,12 +36,26 @@ def make(M, N, K):
     b = torch.randint(0, 256, (N, K // 2), dtype=torch.uint8, device=d)
     asc = torch.randint(125, 130, (M, K // SB), dtype=torch.uint8, device=d)
     bsc = torch.randint(125, 130, (N, K // SB), dtype=torch.uint8, device=d)
-    asp = preshuffle_scale(asc, K, 4)
-    return a.view(torch.int8).view(-1), b.view(torch.int8).view(-1), asp.view(-1), bsc
+    return a.view(torch.int8).view(-1), b.view(torch.int8).view(-1), asc, bsc
+
+
+def ascale(asc, M, K, BM):
+    # A-scale layout follows BLOCK_M: nta = BM//64 (BM256->4, BM192->3). For BM not
+    # dividing M, ceil-pad the rows to a multiple of 16*nta so the edge M-tile's
+    # scale group is covered (no-op for BM256 since M%256==0).
+    nta = BM // 64
+    q = 16 * nta
+    pad = ((M + q - 1) // q) * q
+    if pad != M:
+        ap = torch.zeros((pad, K // SB), dtype=torch.uint8, device=asc.device)
+        ap[:M] = asc
+        asc = ap
+    return preshuffle_scale(asc, K, nta).view(-1)
 
 
 def one(M, N, K, BM, BN, gm, gn, inp):
-    ai, bi, asp, bsc = inp
+    ai, bi, asc, bsc = inp
+    asp = ascale(asc, M, K, BM)
     # B-scale format follows the chosen BLOCK_N: comb (4-scale dwordx4) for BN256,
     # per-region (preshuffle_scale ..., BN//128) for BN128.
     bsp = (preshuffle_scale_b_comb(bsc, K) if BN >= 256
