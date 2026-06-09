@@ -249,24 +249,32 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
     return offs
 
 
-def recommend_config(M, N, K, BLOCK_N=256):
+def recommend_config(M, N, K):
     """Data-driven production config for dense mxfp4 (mode=pipe) on MI355X.
 
-    Returns (BLOCK_M, group_n). Only the verified-solid lever is enabled:
-    the 2D band swizzle (group_n) for VERY wide N. It is bit-exact vs the
-    group_n=0 baseline (pure tile->WG permutation) and det-clean.
+    Returns (BLOCK_M, BLOCK_N, group_n). Two verified-solid levers:
 
-    - group_n = nb//8 (bands ~= num_xcds) for nb>=96 (N>=24576): reliable big-N
-      L2 win, e.g. Llama 70B gate/up N=28672 = +8% (SNR bit-exact, det OK).
-      Narrower N (11008/8192) showed only run-to-run noise -> left at 0.
-    - BLOCK_M stays 256: BLOCK_M=128 doubled the grid on narrow-N (kv) but is
-      NOT correct on this fp4 pipe (SNR -3dB vs BM256 + nondeterministic) -> a
-      latent race in the BM128 path; do not use until root-caused.
+    - BLOCK_N = 128 for grid-underfilled (narrow-N kv) shapes: when the BLOCK_N=256
+      grid has fewer tiles than the 256 active CUs, halving N doubles the N-tiles and
+      fills the grid -> occupancy win (kv M=4096 +5.9%, M=8192 +0.1%). The fp4 pipe
+      BN128 path is det0-clean (300-run maxdiff=0, per-region B-scale w/ wait(1)
+      combined-G2S). This is NOT the discredited BLOCK_M=128 path (that one raced) --
+      N-tiling is a different lever and is correctness-verified. group_n stays 0 here
+      (kv nb at BN128 = 8 << 96).
+    - group_n = nb//8 (bands ~= num_xcds) for nb>=96 (N>=24576): reliable big-N L2
+      win, e.g. Llama 70B gate/up N=28672 = +8% (SNR bit-exact, det OK). Narrower N
+      (11008/8192) showed only run-to-run noise -> left at 0.
+
+    BLOCK_M stays 256 always: BLOCK_M=128 doubled the grid on narrow-N but is NOT
+    correct on this fp4 pipe (SNR -3dB + nondeterministic) -> latent race; do not use.
     """
-    nb = N // BLOCK_N
+    NUM_CUS = 256
     block_m = 256
+    tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
+    block_n = 128 if tiles_256 < NUM_CUS else 256
+    nb = N // block_n
     group_n = nb // 8 if nb >= 96 else 0
-    return block_m, group_n
+    return block_m, block_n, group_n
 
 
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
@@ -461,6 +469,38 @@ def il_mma(mfma, quads, prefetch, ua, n_ta, n_tb, per=8, first=False, pinned=Fal
                     vmem_left -= 1
 
 
+class ScaleBRegion:
+    """Per-N-region B E8M0 scale loader for BLOCK_N=128 (N_TILES_B sub-tiles per
+    64-wide N-half). Mirrors mxfp8 ScaleS2R layout (host = preshuffle_scale(b_sc,
+    K, n_tiles)) but is robust for n_tiles==1, where buffer_load(vec_width=1)
+    returns a scalar (ScaleS2R wraps it in Vec(...) which crashes for scalars).
+    Returns a list of n_tiles raw i32 scale operands (one per B sub-tile)."""
+
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128
+        self.n_tiles = n_tiles
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64
+        nbytes = (dim // self.group_span) * self.K128 * 64 * n_tiles * 4
+        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        grp = base // self.group_span
+        idx = ((grp * self.K128 + k) * 64 + self.lane) * self.n_tiles
+        if self.n_tiles == 1:
+            v = buffer_ops.buffer_load(self.rsrc, idx, vec_width=1, dtype=T.i32)
+            return [_raw(v)]
+        v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=self.n_tiles, dtype=T.i32))
+        return [v[i].ir_value() for i in range_constexpr(self.n_tiles)]
+
+    def load_halves(self, base, lds_block_n, k):
+        """Uniform N-half interface: the two BLOCK_N=128 N-halves (b0 at base,
+        b1 at base+lds_block_n) each carry N_TILES_B scales. Returns (b0, b1).
+        Branch-free vs ScaleBComb (same method name) so pipe `_sb` needs no
+        kernel-body `if` (avoids the FlyDSL AST per-branch-fn trace quirk)."""
+        return self.load(base, k), self.load(base + lds_block_n, k)
+
+
 def compile_mxfp4_gemm_8w(
     *,
     K: int,
@@ -484,7 +524,7 @@ def compile_mxfp4_gemm_8w(
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
     # block_k only affects staged/pipe (direct hardwires 128).
     BLOCK_K = block_k if mode in ("staged", "pipe", "pipeh") else 128
-    assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
+    assert BLOCK_M >= 128 and BLOCK_N >= 128 and BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0
     assert BLOCK_K % 128 == 0 and K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
@@ -500,11 +540,22 @@ def compile_mxfp4_gemm_8w(
     LDS_BLOCK_N = BLOCK_N // 2
     SA_TILES = N_TILES_A
     SB_TILES = N_TILES_B
+    # Combined-B scale (ScaleBComb: one dwordx4 = 4 scales = 2 N-halves x N_TILES_B==2)
+    # is only valid for BLOCK_N==256. BLOCK_N==128 -> N_TILES_B==1: each of the two
+    # 64-wide N-halves (b0/b1) needs 1 scale -> use the generic per-region ScaleS2R
+    # (n_tiles=N_TILES_B) with host preshuffle_scale(b_sc, K, N_TILES_B). r_k1 wires
+    # this in the `direct` mode only; pipe/staged/il keep the BLOCK_N==256 path.
+    B_COMB = BLOCK_N >= 256
 
     # G2S row coverage per step == n_waves * (64 / (BPR/16)) rows.
     _ROWS_PER_STEP = 64 // (BPR // 16) * (512 // 64)  # lanes_per_row -> rows/step * n_waves
     N_LDS_STEPS_A = LDS_BLOCK_M // _ROWS_PER_STEP
     N_LDS_STEPS_B = LDS_BLOCK_N // _ROWS_PER_STEP
+    # Combined-128 B G2S for BLOCK_N<256 (BN128): each 64-wide N half-region is
+    # < _ROWS_PER_STEP(=128) so N_LDS_STEPS_B==0 (G2S empty). The two halves
+    # (b_lds0,b_lds1) are LDS-adjacent, so ONE G2S over the full BLOCK_N rows
+    # fills both (rows 0..63 -> b_lds0, 64..127 -> b_lds1, identity layout).
+    N_LDS_STEPS_B_FULL = BLOCK_N // _ROWS_PER_STEP
     # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
     # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
     LDS_ROW_STRIDE = BPR + (pad_bytes if padded else 0)
@@ -556,12 +607,14 @@ def compile_mxfp4_gemm_8w(
         else:
             gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
             gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+            gl_off_b_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B_FULL, BPR)
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K)
+        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -584,8 +637,13 @@ def compile_mxfp4_gemm_8w(
         for k in range_constexpr(K_ITERS):
             a_g2s.load(a_lds0, A0_off + k * KSTEP)
             a_g2s.load(a_lds1, A1_off + k * KSTEP)
-            b_g2s.load(b_lds0, B0_off + k * KSTEP)
-            b_g2s.load(b_lds1, B1_off + k * KSTEP)
+            if const_expr(B_COMB):
+                b_g2s.load(b_lds0, B0_off + k * KSTEP)
+                b_g2s.load(b_lds1, B1_off + k * KSTEP)
+            else:
+                # BN128: one 128-row G2S over the full BLOCK_N rows fills both
+                # adjacent half-regions (b_lds0 rows 0..63, b_lds1 rows 64..127).
+                b_g2s_full.load(b_lds0, B0_off + k * KSTEP)
             if const_expr(padded):
                 wait_barrier_lgkm()  # 2-hop ds_write completes on lgkm, not vmcnt
             else:
@@ -598,9 +656,14 @@ def compile_mxfp4_gemm_8w(
             # per-sub-block scales (K128 index N_SUB*k + s)
             sa0 = [sa_s2r.load(sa_base0, N_SUB * k + s) for s in range_constexpr(N_SUB)]
             sa1 = [sa_s2r.load(sa_base1, N_SUB * k + s) for s in range_constexpr(N_SUB)]
-            sb_all = [sb_s2r.load(sb_base0, N_SUB * k + s) for s in range_constexpr(N_SUB)]
-            sb0 = [sb_all[s][0:2] for s in range_constexpr(N_SUB)]
-            sb1 = [sb_all[s][2:4] for s in range_constexpr(N_SUB)]
+            if const_expr(B_COMB):
+                sb_all = [sb_s2r.load(sb_base0, N_SUB * k + s) for s in range_constexpr(N_SUB)]
+                sb0 = [sb_all[s][0:2] for s in range_constexpr(N_SUB)]
+                sb1 = [sb_all[s][2:4] for s in range_constexpr(N_SUB)]
+            else:
+                pairs = [sb_s2r.load_halves(sb_base0, LDS_BLOCK_N, N_SUB * k + s) for s in range_constexpr(N_SUB)]
+                sb0 = [pairs[s][0] for s in range_constexpr(N_SUB)]
+                sb1 = [pairs[s][1] for s in range_constexpr(N_SUB)]
 
             c00 = mfma.call_subs(a0, b0, c00, sa0, sb0, N_SUB)
             c01 = mfma.call_subs(a0, b1, c01, sa0, sb1, N_SUB)
@@ -778,12 +841,15 @@ def compile_mxfp4_gemm_8w(
         else:
             gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
             gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+            gl_off_b_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B_FULL, BPR)
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+            # BN128: combined-128 B G2S (one 128-row G2S fills adjacent b0+b1 halves).
+            b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K)
+        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -792,34 +858,50 @@ def compile_mxfp4_gemm_8w(
         sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
         sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
 
-        # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s).
+        # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s). _sb uses the
+        # branch-free `load_halves` so BLOCK_N=128 (per-region) and BLOCK_N=256
+        # (combined dwordx4) share one code path; BN256 packing is unchanged.
         def _sa(base, kiter):
             return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
 
         def _sb(base, kiter):
-            alls = [sb_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
-            return [alls[s][0:2] for s in range_constexpr(N_SUB)], [alls[s][2:4] for s in range_constexpr(N_SUB)]
+            pairs = [sb_s2r.load_halves(base, LDS_BLOCK_N, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+            return [pairs[s][0] for s in range_constexpr(N_SUB)], [pairs[s][1] for s in range_constexpr(N_SUB)]
 
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
         c10_frag = [mfma.zero_value] * N_ACCUMS
         c11_frag = [mfma.zero_value] * N_ACCUMS
 
-        b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
+        if const_expr(B_COMB):
+            b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
+        else:
+            b_g2s_full.load(b_cur0, B0_off + 0 * KSTEP)  # 128-row combined -> b_cur0+b_cur1
         a_g2s.load(a_cur0, A0_off + 0 * KSTEP)
-        b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
+        if const_expr(B_COMB):
+            b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
         a_g2s.load(a_cur1, A1_off + 0 * KSTEP)
 
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        if const_expr(B_COMB):
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        else:
+            wait_barrier(0)  # BN128: conservative prologue drain (one-time, correctness-first)
 
-        b_g2s.load(b_next0, B0_off + 1 * KSTEP)
+        if const_expr(B_COMB):
+            b_g2s.load(b_next0, B0_off + 1 * KSTEP)
+        else:
+            b_g2s_full.load(b_next0, B0_off + 1 * KSTEP)  # 128-row combined -> b_next0+b_next1
         a_g2s.load(a_next0, A0_off + 1 * KSTEP)
-        b_g2s.load(b_next1, B1_off + 1 * KSTEP)
+        if const_expr(B_COMB):
+            b_g2s.load(b_next1, B1_off + 1 * KSTEP)
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        if const_expr(B_COMB):
+            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+        else:
+            wait_barrier(0)  # BN128: conservative prologue drain
 
         sa0 = _sa(sa_base0, KO + 0)
         sa1 = _sa(sa_base1, KO + 0)
@@ -840,7 +922,8 @@ def compile_mxfp4_gemm_8w(
             rocdl.s_barrier()
 
             b1_frag = b_s2r.load(b_cur1)
-            b_g2s.load(b_cur0, B0_off + (k + 2) * KSTEP)
+            if const_expr(B_COMB):
+                b_g2s.load(b_cur0, B0_off + (k + 2) * KSTEP)
             sb0n, sb1n = _sb(sb_base0, KO + k + 1)
             rocdl.s_barrier()
 
@@ -859,8 +942,18 @@ def compile_mxfp4_gemm_8w(
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b_g2s.load(b_cur1, B1_off + (k + 2) * KSTEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            if const_expr(B_COMB):
+                b_g2s.load(b_cur1, B1_off + (k + 2) * KSTEP)
+                wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            else:
+                # BN128 combined k+2 (b_cur0+b_cur1). WAR-safe: b0/b1 reads above are
+                # consumed by the c00/c01/c10 mmas before this overwrite.
+                b_g2s_full.load(b_cur0, B0_off + (k + 2) * KSTEP)
+                # r_k7: wait(3) raced (r_k6); try the tightest overlap-allowing drain = 1
+                # outstanding (combined-spill writes nearly fully drained, but A-refills can
+                # overlap). det0-gated: if this races too, the merged-spill needs vmcnt(0)
+                # and pipe-BN128 perf is infeasible (conservative ≈ staged = loses).
+                wait_barrier(1)
 
             rocdl.s_setprio(1)
             c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB, ua)
@@ -1558,7 +1651,7 @@ def compile_mxfp4_gemm_8w(
         a_ld = Fp4FragLoader(A, c_m, K, N_TILES_A)
         b_ld = Fp4FragLoader(B_T, c_n, K, N_TILES_B)
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K)
+        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -1580,8 +1673,12 @@ def compile_mxfp4_gemm_8w(
             b1 = b_ld.load(b_base1, k)
             sa0 = sa_s2r.load(a_base0, k)
             sa1 = sa_s2r.load(a_base1, k)
-            sb_all = sb_s2r.load(b_base0, k)
-            sb0, sb1 = sb_all[0:2], sb_all[2:4]
+            if const_expr(B_COMB):
+                sb_all = sb_s2r.load(b_base0, k)
+                sb0, sb1 = sb_all[0:2], sb_all[2:4]
+            else:
+                sb0 = sb_s2r.load(b_base0, k)
+                sb1 = sb_s2r.load(b_base1, k)
 
             c00 = mfma.call(a0, b0, c00, sa0, sb0)
             c01 = mfma.call(a0, b1, c01, sa0, sb1)

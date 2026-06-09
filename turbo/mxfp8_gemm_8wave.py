@@ -125,6 +125,13 @@ class ScaleBComb:
         v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=4, dtype=T.i32))
         return [v[i].ir_value() for i in range_constexpr(4)]
 
+    def load_halves(self, base, lds_block_n, k):
+        """Uniform N-half interface (mirrors mxfp4 ScaleBRegion.load_halves):
+        return (b0_scales, b1_scales) for K128 index k. Combined path packs both
+        halves in one dwordx4 (b0=0,1 b1=2,3); lds_block_n unused here."""
+        v = self.load(base, k)
+        return v[0:2], v[2:4]
+
 
 class MfmaScale16x16x128:
     """16x16x128 f8f6f4 MFMA with per-block E8M0 scale operands.
