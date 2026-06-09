@@ -281,7 +281,16 @@ def recommend_config(M, N, K):
     tiles_256 = ((M + 255) // 256) * ((N + 255) // 256)
     block_n = 128 if tiles_256 < NUM_CUS else 256
     nb = N // block_n
-    group_n = nb // 8 if nb >= 96 else 0
+    # round-61: big-K bulk ("down" projections, K>=11008) ALSO benefit from the 2D
+    # band swizzle even at modest nb (16-32), not just very-wide-N (nb>=96). Joint
+    # (group_m x group_n) reliable-interleaved sweep + high-T fresh-data confirm:
+    # 7B down (N=4096,K=11008) gn=2 = +7.9%/+4.1% (M4096/M8192, 15/15); 70B down
+    # (N=8192,K=28672) gn=4 = +1.9%/+0.9% (12-15/15). Overturns r28's "big-K band
+    # hurts" (that was a 1-D gn sweep at fixed gm / non-interleaved = unreliable);
+    # the skill's "2D band general, big-K also +1%" was right. Big-K = larger
+    # per-tile B-stripe L2-reuse deficit. K>=11008 selects exactly the two down
+    # shapes; square/q-o (K<=8192) stay gn0 (joint sweep confirmed noise there).
+    group_n = nb // 8 if (nb >= 96 or K >= 11008) else 0
     group_m = 2 if block_n == 128 else 4
     # B6 (r6_4): BLOCK_M=192 for the grid-underfilled kv regime where the BM256/BN128
     # grid still leaves CUs idle. ceil(M/256)*ceil(N/128) WG at BM256: kv M4096=128wg
