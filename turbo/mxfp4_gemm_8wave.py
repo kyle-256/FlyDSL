@@ -306,6 +306,13 @@ def recommend_config(M, N, K):
             if ((M + _bm - 1) // _bm) * ((N + block_n - 1) // block_n) <= NUM_CUS:
                 block_m = _bm
                 break
+    # B10 (r55): the BM128 kv grid (32 M-tiles x 8 N-tiles = 256 tiles) prefers a
+    # WIDER GROUP_M super-block than the BM192 grid did. r26's gm2 was tuned for the
+    # BM192 22-M-tile grid; re-sweeping for BM128 (interleaved 10/10, kv M4096):
+    # gm8 +1.3% vs gm2, gm1 +0.5%, gm4 -0.2% -> gm8 robust optimum. Pure tile->CU
+    # permutation (bit-exact, det-neutral). kv M8192 stays BM256/gm2 (r26, unchanged).
+    if block_m == 128:
+        group_m = 8
     return block_m, block_n, group_m, group_n
 
 
