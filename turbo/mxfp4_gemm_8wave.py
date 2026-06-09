@@ -559,6 +559,7 @@ def compile_mxfp4_gemm_8w(
     group_n: int = 0,
     split_k: int = 1,
     wave_topo: str = "2x4",
+    a_combine: bool = False,  # B11: combined-128 A (r_a2 perf +1.8-5% but merged-spill RACES on BM128 M8192; gated OFF pending r_a3 wait tuning; default narrow=r55 det0-clean)
 ):
     # block_k: logical fp4 contracted per K-iter. The 16x16x128 MFMA always does
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
@@ -639,7 +640,7 @@ def compile_mxfp4_gemm_8w(
     # waste) and halving the A-G2S issue count. BM192 (BLOCK_M=192!=128) stays the
     # clamp-wave narrow path. Staged-only this round (correctness vehicle); pipe port
     # is r_a2 (needs the merged-spill wait tuning like B's r_k7).
-    A_COMBINE = A_NARROW and (BLOCK_M == _ROWS_PER_STEP)
+    A_COMBINE = a_combine and A_NARROW and (BLOCK_M == _ROWS_PER_STEP)
     N_LDS_STEPS_A_FULL = BLOCK_M // _ROWS_PER_STEP  # 1 for BM128
     # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
     # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
@@ -1010,7 +1011,13 @@ def compile_mxfp4_gemm_8w(
             # reload the last 16-row region (same gmem src + LDS dst -> idempotent,
             # in-bounds, det-safe). All 8 waves issue unconditionally (no dynamic
             # per-wave if -> avoids FlyDSL stateful-object-in-branch TypeError).
-            if const_expr(A_NARROW):
+            if const_expr(A_COMBINE):
+                # B11 (r_a2): combined-128 A loader (mirror b_g2s_full). One 128-row
+                # G2S over LDS-adjacent a_*_0+a_*_1, all 8 waves useful. a_load0 uses
+                # it; the second-half a_load1 calls become no-ops.
+                gl_off_a_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A_FULL, BPR)
+                a_g2s_full = G2SLoader(a_div, gl_off_a_full, N_LDS_STEPS_A_FULL, F8_IR_t, wave_id)
+            elif const_expr(A_NARROW):
                 _wid_a = fx.Int32(wave_id)
                 eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
                 gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
@@ -1043,6 +1050,22 @@ def compile_mxfp4_gemm_8w(
             else:
                 a_g2s.load(dst, off)
 
+        # B11 (r_a2): combined-128 A. a_load0 loads a tile's FIRST half buffer and
+        # (for A_COMBINE) the combined 128-row G2S fills the LDS-adjacent second
+        # half too; a_load1 (second-half call) is then a no-op. For non-A_COMBINE
+        # both fall back to the existing a_load (byte-identical).
+        def a_load0(dst, off):
+            if const_expr(A_COMBINE and not padded):
+                a_g2s_full.load(dst, off)
+            else:
+                a_load(dst, off)
+
+        def a_load1(dst, off):
+            if const_expr(A_COMBINE and not padded):
+                pass  # combined a_load0 already filled this half
+            else:
+                a_load(dst, off)
+
         # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s). _sb uses the
         # branch-free `load_halves` so BLOCK_N=128 (per-region) and BLOCK_N=256
         # (combined dwordx4) share one code path; BN256 packing is unchanged.
@@ -1062,10 +1085,10 @@ def compile_mxfp4_gemm_8w(
             b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
         else:
             b_g2s_full.load(b_cur0, B0_off + 0 * KSTEP)  # 128-row combined -> b_cur0+b_cur1
-        a_load(a_cur0, A0_off + 0 * KSTEP)
+        a_load0(a_cur0, A0_off + 0 * KSTEP)
         if const_expr(B_COMB):
             b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
-        a_load(a_cur1, A1_off + 0 * KSTEP)
+        a_load1(a_cur1, A1_off + 0 * KSTEP)
 
         if wave_m == 1:
             rocdl.s_barrier()
@@ -1079,7 +1102,7 @@ def compile_mxfp4_gemm_8w(
             b_g2s.load(b_next0, B0_off + 1 * KSTEP)
         else:
             b_g2s_full.load(b_next0, B0_off + 1 * KSTEP)  # 128-row combined -> b_next0+b_next1
-        a_load(a_next0, A0_off + 1 * KSTEP)
+        a_load0(a_next0, A0_off + 1 * KSTEP)
         if const_expr(B_COMB):
             b_g2s.load(b_next1, B1_off + 1 * KSTEP)
 
@@ -1098,7 +1121,7 @@ def compile_mxfp4_gemm_8w(
 
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
-            a_load(a_next1, A1_off + (k + 1) * KSTEP)
+            a_load1(a_next1, A1_off + (k + 1) * KSTEP)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -1118,7 +1141,7 @@ def compile_mxfp4_gemm_8w(
             rocdl.s_barrier()
 
             a1_frag = a_s2r.load(a_cur1)
-            a_load(a_cur0, A0_off + (k + 2) * KSTEP)
+            a_load0(a_cur0, A0_off + (k + 2) * KSTEP)
             sa1n = _sa(sa_base1, KO + k + 1)
             rocdl.s_barrier()
 
@@ -1176,7 +1199,7 @@ def compile_mxfp4_gemm_8w(
         rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        a_load(a_next1, A1_off + (KI - 1) * KSTEP)
+        a_load1(a_next1, A1_off + (KI - 1) * KSTEP)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
