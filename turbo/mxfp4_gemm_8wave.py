@@ -933,6 +933,18 @@ def compile_mxfp4_gemm_8w(
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             # BN128: combined-128 B G2S (one 128-row G2S fills adjacent b0+b1 halves).
             b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
+            # B6 BM192 (r6_3): clamp-wave narrow-A G2S. LDS_BLOCK_M=96 < 128 step ->
+            # N_LDS_STEPS_A==0 (regular a_g2s loads nothing). Mirror staged (r6_2):
+            # each 96-row A region filled by one combined G2S step where the wave
+            # index is clamped to [0, NW_A_ACTIVE-1]; waves >= NW_A_ACTIVE redundantly
+            # reload the last 16-row region (same gmem src + LDS dst -> idempotent,
+            # in-bounds, det-safe). All 8 waves issue unconditionally (no dynamic
+            # per-wave if -> avoids FlyDSL stateful-object-in-branch TypeError).
+            if const_expr(A_NARROW):
+                _wid_a = fx.Int32(wave_id)
+                eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
+                gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
+                a_g2s_narrow = G2SLoader(a_div, gl_off_a_narrow, 1, F8_IR_t, eff_wave_a)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         # A-scale num_records must cover the rows the kernel addresses =
@@ -951,6 +963,15 @@ def compile_mxfp4_gemm_8w(
         sa_base0 = fx.Int32(block_m * BLOCK_M + wave_m_offset)
         sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
         sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
+
+        # B6 r6_3: A G2S dispatch. BM192 (A_NARROW) -> clamp-wave narrow loader;
+        # BM256 -> regular a_g2s (byte-identical). const_expr-gated so only the
+        # selected path is traced. Pure side-effect (no captured-var leakage).
+        def a_load(dst, off):
+            if const_expr(A_NARROW and not padded):
+                a_g2s_narrow.load(dst, off)
+            else:
+                a_g2s.load(dst, off)
 
         # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s). _sb uses the
         # branch-free `load_halves` so BLOCK_N=128 (per-region) and BLOCK_N=256
@@ -971,10 +992,10 @@ def compile_mxfp4_gemm_8w(
             b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
         else:
             b_g2s_full.load(b_cur0, B0_off + 0 * KSTEP)  # 128-row combined -> b_cur0+b_cur1
-        a_g2s.load(a_cur0, A0_off + 0 * KSTEP)
+        a_load(a_cur0, A0_off + 0 * KSTEP)
         if const_expr(B_COMB):
             b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
-        a_g2s.load(a_cur1, A1_off + 0 * KSTEP)
+        a_load(a_cur1, A1_off + 0 * KSTEP)
 
         if wave_m == 1:
             rocdl.s_barrier()
@@ -988,7 +1009,7 @@ def compile_mxfp4_gemm_8w(
             b_g2s.load(b_next0, B0_off + 1 * KSTEP)
         else:
             b_g2s_full.load(b_next0, B0_off + 1 * KSTEP)  # 128-row combined -> b_next0+b_next1
-        a_g2s.load(a_next0, A0_off + 1 * KSTEP)
+        a_load(a_next0, A0_off + 1 * KSTEP)
         if const_expr(B_COMB):
             b_g2s.load(b_next1, B1_off + 1 * KSTEP)
 
@@ -1007,7 +1028,7 @@ def compile_mxfp4_gemm_8w(
 
             b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, A1_off + (k + 1) * KSTEP)
+            a_load(a_next1, A1_off + (k + 1) * KSTEP)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -1027,7 +1048,7 @@ def compile_mxfp4_gemm_8w(
             rocdl.s_barrier()
 
             a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, A0_off + (k + 2) * KSTEP)
+            a_load(a_cur0, A0_off + (k + 2) * KSTEP)
             sa1n = _sa(sa_base1, KO + k + 1)
             rocdl.s_barrier()
 
@@ -1085,7 +1106,7 @@ def compile_mxfp4_gemm_8w(
         rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
-        a_g2s.load(a_next1, A1_off + (KI - 1) * KSTEP)
+        a_load(a_next1, A1_off + (KI - 1) * KSTEP)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
