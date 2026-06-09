@@ -535,7 +535,10 @@ def compile_mxfp4_gemm_8w(
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
     # block_k only affects staged/pipe (direct hardwires 128).
     BLOCK_K = block_k if mode in ("staged", "pipe", "pipeh") else 128
-    assert BLOCK_M >= 128 and BLOCK_M % 128 == 0
+    # B6: BLOCK_M=192 (small-M occupancy for grid-underfilled kv) needs only
+    # BLOCK_M % 64 == 0 (N_TILES_A = BLOCK_M//64 integral) + (BLOCK_M//2) % 16 == 0
+    # (LDS region a 16-row-wave granular). BM192 -> N_TILES_A=3, LDS_BLOCK_M=96.
+    assert BLOCK_M >= 128 and BLOCK_M % 64 == 0 and (BLOCK_M // 2) % 16 == 0
     # B4 (wave_topo="4x2", 4 M-waves x 2 N-waves) makes BLOCK_N=64 expressible
     # (N_TILES_B = BLOCK_N//64 = 1); the default 2x4 topology floors BLOCK_N at 128.
     assert wave_topo in ("2x4", "4x2")
@@ -591,6 +594,14 @@ def compile_mxfp4_gemm_8w(
     # >= NW_B_ACTIVE are predicated out (no over-read past the B region, no LDS OOB).
     B_NARROW = BLOCK_N < _ROWS_PER_STEP
     NW_B_ACTIVE = BLOCK_N // 16  # 16 B rows per wave (lanes_per_row=4 -> 64/4)
+    # B6: A analog of the narrow-B clamp-wave G2S. BM192 -> LDS_BLOCK_M=96 < step
+    # (128) -> N_LDS_STEPS_A==0 (A G2S empty). Fix: clamp-wave combined G2S per
+    # 96-row A region (NW_A_ACTIVE=6 waves x 16 rows = 96; waves >= 6 redundantly
+    # reload the last 16-row region -> in-bounds, idempotent, det-safe). Mirror of
+    # the round-19/20 narrow-B fix, applied per-region (a_lds0, a_lds1) instead of
+    # the combined-adjacent B trick.
+    A_NARROW = LDS_BLOCK_M < _ROWS_PER_STEP
+    NW_A_ACTIVE = LDS_BLOCK_M // 16  # 16 A rows per wave
     # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
     # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
     LDS_ROW_STRIDE = BPR + (pad_bytes if padded else 0)
@@ -658,9 +669,21 @@ def compile_mxfp4_gemm_8w(
                 eff_wave_b = (_wid_b < fx.Int32(NW_B_ACTIVE)).select(_wid_b, fx.Int32(max(NW_B_ACTIVE - 1, 0)))
                 gl_off_b_narrow = fp4_g2s_offsets(lane_id, eff_wave_b, K, 1, BPR)
                 b_g2s_narrow = G2SLoader(b_div, gl_off_b_narrow, 1, F8_IR_t, eff_wave_b)
+            if const_expr(A_NARROW):
+                _wid_a = fx.Int32(wave_id)
+                eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
+                gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
+                a_g2s_narrow = G2SLoader(a_div, gl_off_a_narrow, 1, F8_IR_t, eff_wave_a)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
@@ -682,8 +705,13 @@ def compile_mxfp4_gemm_8w(
         c11 = [mfma.zero_value] * N_ACCUMS
 
         for k in range_constexpr(K_ITERS):
-            a_g2s.load(a_lds0, A0_off + k * KSTEP)
-            a_g2s.load(a_lds1, A1_off + k * KSTEP)
+            if const_expr(A_NARROW and not padded):
+                # B6 BM192: clamp-wave combined G2S per 96-row A region.
+                a_g2s_narrow.load(a_lds0, A0_off + k * KSTEP)
+                a_g2s_narrow.load(a_lds1, A1_off + k * KSTEP)
+            else:
+                a_g2s.load(a_lds0, A0_off + k * KSTEP)
+                a_g2s.load(a_lds1, A1_off + k * KSTEP)
             if const_expr(B_COMB):
                 b_g2s.load(b_lds0, B0_off + k * KSTEP)
                 b_g2s.load(b_lds1, B1_off + k * KSTEP)
@@ -768,7 +796,14 @@ def compile_mxfp4_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
@@ -900,7 +935,14 @@ def compile_mxfp4_gemm_8w(
             b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
@@ -1145,7 +1187,14 @@ def compile_mxfp4_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K)
         store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
@@ -1344,7 +1393,14 @@ def compile_mxfp4_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
@@ -1614,7 +1670,14 @@ def compile_mxfp4_gemm_8w(
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
         wm_off = wave_m * (N_TILES_A * 16)
@@ -1702,7 +1765,14 @@ def compile_mxfp4_gemm_8w(
         mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, asm=asm_mfma, asm_se=asm_se)
         a_ld = Fp4FragLoader(A, c_m, K, N_TILES_A)
         b_ld = Fp4FragLoader(B_T, c_n, K, N_TILES_B)
-        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        # A-scale num_records must cover the rows the kernel addresses =
+        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
+        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
+        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
+        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
+        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
         sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
