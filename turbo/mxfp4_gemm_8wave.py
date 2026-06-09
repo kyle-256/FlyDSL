@@ -878,6 +878,27 @@ def compile_mxfp4_gemm_8w(
         B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+    # B8 (round-45 r8_2): 3-stage LDS ring -> producer runs 2 K-iters ahead so the
+    # k+2 G2S targets a FRESH stage buffer (never the just-read one), making the
+    # per-sub-burst read-before-overwrite barriers redundant (removed in r8_3).
+    # 12 buffers (3 stages x A/B x 2 halves) = 96KB of 160KB; occupancy-free (kernel
+    # is VGPR=228-bound -> already 1 WG/CU, +32KB LDS stays 1 WG/CU). See
+    # rounds/round-44/B8_DEEPER_RING_DESIGN.md.
+    @fx.struct
+    class SharedStorageFp4Pipe3:
+        A_s0_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s0_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s1_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s1_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s2_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s2_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        B_s0_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s0_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s1_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s1_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s2_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s2_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm_pipe(
         A: fx.Tensor,
@@ -1163,6 +1184,153 @@ def compile_mxfp4_gemm_8w(
         c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB, asm_mfma)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
+    def kernel_gemm_pipe3(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+    ):
+        # B8 r8_2: 3-stage LDS ring (cur/next/next2). Bulk-only (BN256/BM256/B_COMB,
+        # split_k==1, no A_NARROW/padded). Producer runs 2 K-iters ahead -> the k+2
+        # G2S targets a FRESH stage[(k+2)%3] (never the just-read stage[k%3]) so the
+        # in-place read-before-overwrite hazard that forced pipe's ~8 barrier/K-iter
+        # is GONE. r8_2 (this) keeps the per-sub-burst s_barrier (correctness-first,
+        # isolate rotation correctness) + one full vmcnt-drain wait_barrier(0)/iter;
+        # r8_3 removes the now-redundant s_barriers to coarsen toward aiter's ~1/iter.
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+
+        lds = fx.SharedAllocator().allocate(SharedStorageFp4Pipe3).peek()
+        A_lds = [[lds.A_s0_0, lds.A_s0_1], [lds.A_s1_0, lds.A_s1_1], [lds.A_s2_0, lds.A_s2_1]]
+        B_lds = [[lds.B_s0_0, lds.B_s0_1], [lds.B_s1_0, lds.B_s1_1], [lds.B_s2_0, lds.B_s2_1]]
+
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        block_m, block_n = grouped_xcd_pid(fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N,
+                                           group_m=group_m, num_xcds=num_xcds, group_n=group_n)
+
+        A0_off = block_m * BLOCK_M * K2
+        A1_off = (block_m * BLOCK_M + LDS_BLOCK_M) * K2
+        B0_off = block_n * BLOCK_N * K2
+        B1_off = (block_n * BLOCK_N + LDS_BLOCK_N) * K2
+
+        gA = make_fp8_buffer_tensor(A, F8_IR_t)
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, asm=asm_mfma, asm_se=asm_se)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
+        _sa_q = 16 * SA_TILES
+        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
+        sb_s2r = ScaleBComb(B_scale, c_n, K)
+        store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        sa_base0 = fx.Int32(block_m * BLOCK_M + wave_m_offset)
+        sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
+        sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
+
+        def _sa(base, kiter):
+            return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+
+        def _sb(base, kiter):
+            pairs = [sb_s2r.load_halves(base, LDS_BLOCK_N, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+            return [pairs[s][0] for s in range_constexpr(N_SUB)], [pairs[s][1] for s in range_constexpr(N_SUB)]
+
+        c00_frag = [mfma.zero_value] * N_ACCUMS
+        c01_frag = [mfma.zero_value] * N_ACCUMS
+        c10_frag = [mfma.zero_value] * N_ACCUMS
+        c11_frag = [mfma.zero_value] * N_ACCUMS
+
+        # Prologue: prime stage 0 (k=0) and stage 1 (k=1), all 4 buffers each.
+        b_g2s.load(B_lds[0][0], B0_off + 0 * KSTEP)
+        a_g2s.load(A_lds[0][0], A0_off + 0 * KSTEP)
+        b_g2s.load(B_lds[0][1], B1_off + 0 * KSTEP)
+        a_g2s.load(A_lds[0][1], A1_off + 0 * KSTEP)
+        if wave_m == 1:
+            rocdl.s_barrier()
+        wait_barrier(0)
+        if const_expr(KI > 1):
+            b_g2s.load(B_lds[1][0], B0_off + 1 * KSTEP)
+            a_g2s.load(A_lds[1][0], A0_off + 1 * KSTEP)
+            b_g2s.load(B_lds[1][1], B1_off + 1 * KSTEP)
+            a_g2s.load(A_lds[1][1], A1_off + 1 * KSTEP)
+        wait_barrier(0)
+
+        sa0 = _sa(sa_base0, 0)
+        sa1 = _sa(sa_base1, 0)
+        sb0, sb1 = _sb(sb_base0, 0)
+
+        for k in range_constexpr(KI):
+            cur = k % 3
+            n2 = (k + 2) % 3
+            ua = False if k == 0 else asm_mfma
+            if const_expr(k + 1 < KI):
+                sa0n = _sa(sa_base0, k + 1)
+
+            b0_frag = b_s2r.load(B_lds[cur][0])
+            a0_frag = a_s2r.load(A_lds[cur][0])
+            if const_expr(k + 2 < KI):
+                a_g2s.load(A_lds[n2][1], A1_off + (k + 2) * KSTEP)
+            rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB, ua)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            b1_frag = b_s2r.load(B_lds[cur][1])
+            if const_expr(k + 2 < KI):
+                b_g2s.load(B_lds[n2][0], B0_off + (k + 2) * KSTEP)
+            if const_expr(k + 1 < KI):
+                sb0n, sb1n = _sb(sb_base0, k + 1)
+            rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB, ua)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            a1_frag = a_s2r.load(A_lds[cur][1])
+            if const_expr(k + 2 < KI):
+                a_g2s.load(A_lds[n2][0], A0_off + (k + 2) * KSTEP)
+            if const_expr(k + 1 < KI):
+                sa1n = _sa(sa_base1, k + 1)
+            rocdl.s_barrier()
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB, ua)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            if const_expr(k + 2 < KI):
+                b_g2s.load(B_lds[n2][1], B1_off + (k + 2) * KSTEP)
+            wait_barrier(0)
+            rocdl.s_setprio(1)
+            c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB, ua)
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+
+            if const_expr(k + 1 < KI):
+                sa0, sa1 = sa0n, sa1n
+                sb0, sb1 = sb0n, sb1n
 
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
@@ -1856,6 +2024,7 @@ def compile_mxfp4_gemm_8w(
     ):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N) * split_k
         kern = {"staged": kernel_gemm_staged, "pipe": kernel_gemm_pipe, "pipeh": kernel_gemm_pipeh,
+                "pipe3": kernel_gemm_pipe3,
                 "pipeb": kernel_gemm_pipeb,
                 "il": kernel_gemm_il, "rt": kernel_gemm_rt, "rt2": kernel_gemm_rt2}.get(mode, kernel_gemm)
         kern(
