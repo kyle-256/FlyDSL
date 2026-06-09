@@ -252,7 +252,7 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
 def recommend_config(M, N, K):
     """Data-driven production config for dense mxfp4 (mode=pipe) on MI355X.
 
-    Returns (BLOCK_M, BLOCK_N, group_n). Two verified-solid levers:
+    Returns (BLOCK_M, BLOCK_N, group_m, group_n). Three verified-solid levers:
 
     - BLOCK_N = 128 for grid-underfilled (narrow-N kv) shapes: when the BLOCK_N=256
       grid has fewer tiles than the 256 active CUs, halving N doubles the N-tiles and
@@ -267,6 +267,15 @@ def recommend_config(M, N, K):
 
     BLOCK_M stays 256 always: BLOCK_M=128 doubled the grid on narrow-N but is NOT
     correct on this fp4 pipe (SNR -3dB + nondeterministic) -> latent race; do not use.
+
+    - group_m = 2 for the narrow-N grid-underfill (kv) regime (block_n==128). The
+      per-shape autotune (round-26) found the static group_m=4 GROUP_M tiling is a
+      per-shape config error for kv: with only ~8 N-tiles, the GROUP_M=4 M-clustering
+      hurts XCD/L2 locality. group_m=2 is a robust +6.9% on kv M=8192 (3-trial:
+      gm=4 [2549,2578,2624] vs gm=2 [2748,2767,2770], full separation) and neutral
+      on kv M=4096 (+0.4%, no regress). Pure tile->CU permutation => bit-exact + det0.
+      Wide-N shapes (block_n==256) keep group_m=4 (autotune confirmed gm sweep there
+      is run-to-run noise; the band group_n lever owns their L2 locality).
     """
     NUM_CUS = 256
     block_m = 256
@@ -274,7 +283,8 @@ def recommend_config(M, N, K):
     block_n = 128 if tiles_256 < NUM_CUS else 256
     nb = N // block_n
     group_n = nb // 8 if nb >= 96 else 0
-    return block_m, block_n, group_n
+    group_m = 2 if block_n == 128 else 4
+    return block_m, block_n, group_m, group_n
 
 
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
