@@ -519,12 +519,20 @@ def compile_mxfp4_gemm_8w(
     num_xcds: int = 8,
     group_n: int = 0,
     split_k: int = 1,
+    wave_topo: str = "2x4",
 ):
     # block_k: logical fp4 contracted per K-iter. The 16x16x128 MFMA always does
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
     # block_k only affects staged/pipe (direct hardwires 128).
     BLOCK_K = block_k if mode in ("staged", "pipe", "pipeh") else 128
-    assert BLOCK_M >= 128 and BLOCK_N >= 128 and BLOCK_M % 128 == 0 and BLOCK_N % 128 == 0
+    assert BLOCK_M >= 128 and BLOCK_M % 128 == 0
+    # B4 (wave_topo="4x2", 4 M-waves x 2 N-waves) makes BLOCK_N=64 expressible
+    # (N_TILES_B = BLOCK_N//64 = 1); the default 2x4 topology floors BLOCK_N at 128.
+    assert wave_topo in ("2x4", "4x2")
+    if wave_topo == "4x2":
+        assert BLOCK_N >= 64 and BLOCK_N % 64 == 0
+    else:
+        assert BLOCK_N >= 128 and BLOCK_N % 128 == 0
     assert BLOCK_K % 128 == 0 and K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
@@ -533,8 +541,18 @@ def compile_mxfp4_gemm_8w(
     N_SUB = BLOCK_K // 128  # 128-K MFMA sub-blocks per K-iter
     BPR = BLOCK_K // 2  # packed-fp4 bytes per K-iter row in LDS
     KSTEP = BPR  # gmem byte stride per K-iter
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 128
+    # Wave topology: 2x4 = 2 M-waves x 4 N-waves (default); 4x2 = 4 M-waves x 2
+    # N-waves. NW_N = #N-waves (the kernel-body divisor: wave_m=wave_id//NW_N,
+    # wave_n=wave_id%NW_N). Region halving (c00/c01/c10/c11, LDS_BLOCK_*) is
+    # topology-independent; only the per-wave tile counts flip.
+    if wave_topo == "4x2":
+        NW_N = 2
+        N_TILES_A = BLOCK_M // 128
+        N_TILES_B = BLOCK_N // 64
+    else:
+        NW_N = 4
+        N_TILES_A = BLOCK_M // 64
+        N_TILES_B = BLOCK_N // 128
     N_ACCUMS = N_TILES_A * N_TILES_B
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
@@ -556,6 +574,13 @@ def compile_mxfp4_gemm_8w(
     # (b_lds0,b_lds1) are LDS-adjacent, so ONE G2S over the full BLOCK_N rows
     # fills both (rows 0..63 -> b_lds0, 64..127 -> b_lds1, identity layout).
     N_LDS_STEPS_B_FULL = BLOCK_N // _ROWS_PER_STEP
+    # BN < _ROWS_PER_STEP (e.g. BN64=64 < 128): the whole B tile is narrower than
+    # one cooperative G2S step, so N_LDS_STEPS_B_FULL==0 (B never loads). Fix:
+    # a partial-wave combined G2S -- only the first NW_B_ACTIVE waves (16 rows
+    # each) issue one step, filling b_lds0 + the LDS-adjacent b_lds1. Waves
+    # >= NW_B_ACTIVE are predicated out (no over-read past the B region, no LDS OOB).
+    B_NARROW = BLOCK_N < _ROWS_PER_STEP
+    NW_B_ACTIVE = BLOCK_N // 16  # 16 B rows per wave (lanes_per_row=4 -> 64/4)
     # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
     # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
     LDS_ROW_STRIDE = BPR + (pad_bytes if padded else 0)
@@ -591,8 +616,8 @@ def compile_mxfp4_gemm_8w(
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
-        wave_m = wave_id // 4
-        wave_n = wave_id % 4
+        wave_m = wave_id // NW_N
+        wave_n = wave_id % NW_N
         block_m, block_n = divmod(fx.block_idx.x, n_blocks)
 
         gA = make_fp8_buffer_tensor(A, F8_IR_t)
@@ -611,6 +636,18 @@ def compile_mxfp4_gemm_8w(
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
+            # B4 narrow-B G2S (BLOCK_N < step): one combined G2S step where the
+            # wave index is clamped to [0, NW_B_ACTIVE-1]. Waves >= NW_B_ACTIVE
+            # redundantly reload the last valid 16-row region (same gmem src + same
+            # LDS dst -> idempotent, det-safe) instead of writing past the B region.
+            # All 8 waves issue unconditionally -> no dynamic per-wave `if` (FlyDSL
+            # traces stateful objects referenced in a dynamic-if branch as MLIR
+            # state and raises TypeError).
+            if const_expr(B_NARROW):
+                _wid_b = fx.Int32(wave_id)
+                eff_wave_b = (_wid_b < fx.Int32(NW_B_ACTIVE)).select(_wid_b, fx.Int32(max(NW_B_ACTIVE - 1, 0)))
+                gl_off_b_narrow = fp4_g2s_offsets(lane_id, eff_wave_b, K, 1, BPR)
+                b_g2s_narrow = G2SLoader(b_div, gl_off_b_narrow, 1, F8_IR_t, eff_wave_b)
         a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
         sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
@@ -640,6 +677,11 @@ def compile_mxfp4_gemm_8w(
             if const_expr(B_COMB):
                 b_g2s.load(b_lds0, B0_off + k * KSTEP)
                 b_g2s.load(b_lds1, B1_off + k * KSTEP)
+            elif const_expr(B_NARROW):
+                # BN64 (B4): clamped-wave combined G2S fills b_lds0 + LDS-adjacent
+                # b_lds1 with the BLOCK_N B rows (all waves issue; >= NW_B_ACTIVE
+                # redundantly reload the last region -> in-bounds, idempotent).
+                b_g2s_narrow.load(b_lds0, B0_off + k * KSTEP)
             else:
                 # BN128: one 128-row G2S over the full BLOCK_N rows fills both
                 # adjacent half-regions (b_lds0 rows 0..63, b_lds1 rows 64..127).
