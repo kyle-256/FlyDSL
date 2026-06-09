@@ -290,8 +290,22 @@ def recommend_config(M, N, K):
     # already 256wg-full at BM256 -> BM192 (344wg) overshoots & regresses -18%, so gate
     # on the underfill. NOT the discredited BLOCK_M=128 (that raced); BM192 is the
     # quadrant's smallest correct M-tile (N_TILES_A=3, narrow-A-G2S clamp-wave).
-    wg_bm256 = ((M + 255) // 256) * ((N + block_n - 1) // block_n)
-    block_m = 192 if (block_n == 128 and wg_bm256 < NUM_CUS) else 256
+    # B10 (r10, round-54): among {128,192,256}, pick the SMALLEST BLOCK_M whose grid
+    # does not overshoot NUM_CUS (more M-tiles = fuller grid) for the underfilled kv
+    # regime (block_n==128). kv M4096 -> BM128 (256wg FULL, +1.9% over BM192/176wg,
+    # interleaved 10/10 thermal-matched); kv M8192 -> BM256 (256wg-full; BM128=512wg
+    # / BM192=344wg both overshoot -> regress). BM128 is now CORRECT + DET0 on the
+    # production pipe (staged+pipe SNR 55.6, pipe det0 2pass x 200run) — the
+    # pre-campaign "BM128 races (SNR -3dB nondet)" death-list entry PRE-DATED the
+    # narrow-A-G2S clamp-wave (r6_3, BM128 reuses it: LDS_BLOCK_M=64<128 -> A_NARROW,
+    # NW_A_ACTIVE=4) and wait_barrier(1) (r_k7) race fixes; both falsify that entry.
+    # Wide-N (block_n==256) always BM256. Supersedes the r6_4 BM192 kv route.
+    block_m = 256
+    if block_n == 128:
+        for _bm in (128, 192):
+            if ((M + _bm - 1) // _bm) * ((N + block_n - 1) // block_n) <= NUM_CUS:
+                block_m = _bm
+                break
     return block_m, block_n, group_m, group_n
 
 
