@@ -290,7 +290,17 @@ def recommend_config(M, N, K):
     # the skill's "2D band general, big-K also +1%" was right. Big-K = larger
     # per-tile B-stripe L2-reuse deficit. K>=11008 selects exactly the two down
     # shapes; square/q-o (K<=8192) stay gn0 (joint sweep confirmed noise there).
-    group_n = nb // 8 if (nb >= 96 or K >= 11008) else 0
+    # round-76 (aligned nx x gn joint sweep, GOLD T=15 fresh-data interleaved): the
+    # "down" (K>>N) regime wants an ABSOLUTE band width ~4, not nb//8. 7B down
+    # (nb=16) nb//8=2 -> gn=4 confirmed +1.0%/+1.5% (M4096/M8192, 15/15 both); 70B
+    # down (nb=32) already nb//8=4 (byte-identical). big-N (nb>=96) keeps nb//8 (=14
+    # for 70B gate/up, #bands=#XCD). r61's nb//8 down rule under-set 7B down's band.
+    if nb >= 96:
+        group_n = nb // 8
+    elif K >= 11008:
+        group_n = 4
+    else:
+        group_n = 0
     group_m = 2 if block_n == 128 else 4
     # B6 (r6_4): BLOCK_M=192 for the grid-underfilled kv regime where the BM256/BN128
     # grid still leaves CUs idle. ceil(M/256)*ceil(N/128) WG at BM256: kv M4096=128wg
