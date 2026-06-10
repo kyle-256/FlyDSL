@@ -24,7 +24,7 @@ for p in (_REPO_ROOT, _PYFLYDSL_SRC):
 
 import flydsl.compiler as flyc  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
-from turbo.mxfp4_gemm_8wave import compile_mxfp4_gemm_8w  # noqa: E402
+from turbo.mxfp4_gemm_8wave import compile_mxfp4_gemm_8w, preshuffle_mxfp4_scales  # noqa: E402
 from turbo.mxfp8_gemm_8wave import preshuffle_scale, preshuffle_scale_b_comb  # noqa: E402
 
 SCALE_BLOCK = 32
@@ -56,8 +56,7 @@ def det_one(M, N, K, runs, passes, BLOCK_M=256, BLOCK_N=256):
     first_bad = (-1, -1)
     for pi in range(passes):
         a, b, asc, bsc = _mk(M, N, K, dev)
-        a_sp = preshuffle_scale(asc, K, BLOCK_M // 64)
-        b_sp = preshuffle_scale_b_comb(bsc, K)
+        a_sp, b_sp = preshuffle_mxfp4_scales(asc, bsc, K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, mode=MODE)
         c = torch.zeros((M, N), dtype=torch.bfloat16, device=dev)
 
         def args(cc):

@@ -80,6 +80,162 @@ from turbo.mxfp8_gemm_8wave import (
 )
 
 
+def _packed_eligible(mode, BLOCK_N, asm_mfma, padded):
+    """Whether the packed-scale (opsel) path applies: production pipe, BN256
+    combined-B, intrinsic MFMA, non-padded LDS. Single source of truth shared by
+    the kernel (compile_mxfp4_gemm_8w) and the host scale prep."""
+    return mode == "pipe" and BLOCK_N >= 256 and not asm_mfma and not padded
+
+
+def preshuffle_mxfp4_scales(a_e8m0, b_e8m0, K, BLOCK_M=256, BLOCK_N=256,
+                            mode="pipe", asm_mfma=False, padded=False, combine_a=True):
+    """Host scale prep matching the kernel's chosen layout: PACKED (opsel) for the
+    eligible production pipe path, else broadcast-dwordx4. combine_a packs both
+    M-regions' A scale into one coalesced dwordx2 (default). Returns
+    (a_scale_i32, b_scale_i32) -- keeps host & kernel in lockstep."""
+    n_tiles_a = BLOCK_M // 64
+    if _packed_eligible(mode, BLOCK_N, asm_mfma, padded):
+        a_pk = (preshuffle_scale_packed_a2(a_e8m0, K, n_tiles_a) if (combine_a and BLOCK_M == 256)
+                else preshuffle_scale_packed(a_e8m0, K, n_tiles_a))
+        return a_pk, preshuffle_scale_b_comb_packed(b_e8m0, K)
+    a_bc = preshuffle_scale(a_e8m0, K, n_tiles_a)
+    if BLOCK_N >= 256:  # combined-B (B_COMB)
+        return a_bc, preshuffle_scale_b_comb(b_e8m0, K)
+    return a_bc, preshuffle_scale(b_e8m0, K, BLOCK_N // 128)  # BN128: per-region B (ScaleBRegion)
+
+
+def preshuffle_scale_packed(e8m0_u8, K, n_tiles):
+    """PACKED E8M0 pre-shuffle (official CK-style): pack the wave's ``n_tiles``
+    sub-tile scales into the 4 BYTES of ONE i32 (byte t = tile t's E8M0), instead
+    of broadcasting each tile to its own dword. The MFMA then selects tile t's
+    scale via opsel_a=t -- so the kernel loads ONE dword per (region,k) instead of
+    a dwordx4 (4x less scale VMEM traffic / VMEM-unit occupancy, the bulk lever).
+
+    Input : uint8 [DIM, K//32] (DIM multiple of 16*n_tiles, n_tiles<=4).
+    Output: int32 [DIM//(16*n_tiles), K//128, 64] where byte t of SP[grp,k,lane]
+        == scale[grp*16*n_tiles + t*16 + lane%16, 4k + lane//16].
+    """
+    import torch
+
+    DIM, Kb = e8m0_u8.shape
+    assert Kb == K // 32 and K % 128 == 0 and n_tiles <= 4
+    assert DIM % (16 * n_tiles) == 0, f"DIM={DIM} must be multiple of {16 * n_tiles}"
+    K128 = K // 128
+    G = DIM // (16 * n_tiles)
+    s = e8m0_u8.reshape(DIM, K128, 4)                       # [DIM, k, g]
+    s = s.reshape(G, n_tiles, 16, K128, 4)                  # [grp, t, r, k, g]
+    s = s.permute(0, 3, 4, 2, 1).contiguous()              # [grp, k, g, r, t]
+    s = s.reshape(G, K128, 64, n_tiles).to(torch.int32)    # lane == g*16 + r
+    packed = s[..., 0].clone()
+    for t in range(1, n_tiles):
+        packed = packed | (s[..., t] << (8 * t))
+    return packed.contiguous()                              # [G, K128, 64] i32
+
+
+def preshuffle_scale_b_comb_packed(e8m0_u8, K):
+    """Combined-B PACKED pre-shuffle: pack a wave's 4 B sub-tiles (b0:0,16; b1:128,
+    144) into the 4 bytes of ONE i32 (byte i = B-tile i). MFMA selects via opsel_b
+    (b0 -> opsel 0,1; b1 -> opsel 2,3). One dword per K-iter for all B scales.
+
+    Output: int32 [N//64, K//128, 64], byte i of SP[grp,k,lane]
+        == scale[block_n*256 + wave_n*32 + OFF[i] + lane%16, 4k + lane//16].
+    """
+    import torch
+
+    N, Kb = e8m0_u8.shape
+    assert Kb == K // 32 and K % 128 == 0 and N % 256 == 0
+    K128 = K // 128
+    OFF = [0, 16, 128, 144]
+    s = e8m0_u8.reshape(N // 256, 256, K128, 4)
+    wn = torch.arange(4).view(4, 1, 1)
+    si = torch.arange(4).view(1, 4, 1)
+    r = torch.arange(16).view(1, 1, 16)
+    off = torch.tensor(OFF).view(1, 4, 1)
+    colidx = (wn * 32 + off + r).reshape(-1)
+    g = s[:, colidx, :, :].reshape(N // 256, 4, 4, 16, K128, 4)  # [nblk, wn, si, r, k, g]
+    g = g.permute(0, 1, 4, 5, 3, 2).contiguous()                # [nblk, wn, k, g, r, si]
+    g = g.reshape(N // 64, K128, 64, 4).to(torch.int32)         # grp=nblk*4+wn, lane=g*16+r
+    packed = g[..., 0] | (g[..., 1] << 8) | (g[..., 2] << 16) | (g[..., 3] << 24)
+    return packed.contiguous()                                  # [N//64, K128, 64] i32
+
+
+def preshuffle_scale_packed_a2(e8m0_u8, K, n_tiles):
+    """Combine-A packed layout: interleave the TWO M-regions' packed A scale into a
+    COALESCED dwordx2 so the kernel issues ONE load (instead of two) for both regions
+    per K-iter. region0 = group g0, region1 = g0+2 (region1 is +LDS_BLOCK_M=+128 rows
+    = +2 groups). Output int32 [n_wi, K//128, 64, 2] (wi = block_m*2 + wave_m), last
+    dim {region0, region1}. Coalesced (lane-consecutive) -- unlike the K-batch
+    transpose; cuts the 3 scale loads/iter to 2 without breaking coalescing."""
+    import torch
+
+    p = preshuffle_scale_packed(e8m0_u8, K, n_tiles)   # [G, K128, 64]
+    G, K128, _ = p.shape
+    assert G % 2 == 0, f"combine-A needs even group count, got G={G}"
+    n_wi = G // 2
+    out = torch.empty((n_wi, K128, 64, 2), dtype=torch.int32, device=p.device)
+    for wi in range(n_wi):
+        g0 = (wi // 2) * 4 + (wi % 2)                   # block_m*4 + wave_m
+        out[wi, :, :, 0] = p[g0]
+        out[wi, :, :, 1] = p[g0 + 2]                    # region1 = +2 groups
+    return out.contiguous()
+
+
+class ScaleS2RPackedA2:
+    """Combine-A loader: ONE coalesced dwordx2 returns both M-regions' packed scale
+    [region0_dword, region1_dword] for a (wi, k, lane). Pairs with
+    preshuffle_scale_packed_a2. base is the region0 base; wi derived from it."""
+
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64
+        n_wi = (dim // self.group_span) // 2
+        nbytes = n_wi * self.K128 * 64 * 2 * 4
+        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base0, k):
+        wi = (base0 // 256) * 2 + (base0 % 256) // 64
+        idx = ((wi * self.K128 + k) * 64 + self.lane) * 2
+        v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=2, dtype=T.i32))
+        return [_raw(v[0]), _raw(v[1])]
+
+
+class ScaleS2RPacked:
+    """Packed-scale loader: ONE dword per (region, k) holding n_tiles E8M0 scales
+    (byte t = tile t). Pairs with ``preshuffle_scale_packed``. The tile index is
+    consumed as the MFMA opsel, so .load returns a single raw i32 (the packed dword)."""
+
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128
+        self.n_tiles = n_tiles
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64
+        nbytes = (dim // self.group_span) * self.K128 * 64 * 4  # int32 records, 1/lane
+        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        grp = base // self.group_span
+        idx = (grp * self.K128 + k) * 64 + self.lane
+        return _raw(buffer_ops.buffer_load(self.rsrc, idx, vec_width=1, dtype=T.i32))
+
+
+class ScaleBCombPacked:
+    """Combined-B packed loader: ONE dword/(k) holding all 4 B sub-tile scales
+    (b0:bytes 0,1; b1:bytes 2,3). Pairs with ``preshuffle_scale_b_comb_packed``."""
+
+    def __init__(self, sp_tensor, dim, K):
+        self.K128 = K // 128
+        self.lane = fx.thread_idx.x % 64
+        nbytes = (dim // 64) * self.K128 * 64 * 4
+        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base, k):
+        # grp = block_n*4 + wave_n (matches ScaleBComb / preshuffle_scale_b_comb_packed).
+        grp = (base // 256) * 4 + (base % 256) // 32
+        idx = (grp * self.K128 + k) * 64 + self.lane
+        return _raw(buffer_ops.buffer_load(self.rsrc, idx, vec_width=1, dtype=T.i32))
+
+
 class StoreCAtomic:
     """Split-K epilogue: atomic-add the FP32 accumulator into an FP32 scratch C.
 
@@ -144,13 +300,14 @@ class MfmaScaleFp4:
     _ASM0 = "v_mfma_scale_f32_16x16x128_f8f6f4 $0, $1, $2, 0, $3, $4 op_sel_hi:[0,0,0] cbsz:4 blgp:4"
     _CONS0 = "=a,v,v,v,v"
 
-    def __init__(self, n_tiles_a, n_tiles_b, asm=False, asm_se=False):
+    def __init__(self, n_tiles_a, n_tiles_b, asm=False, asm_se=False, packed=False):
         self.res_ty = Vec.make_type(4, fx.Float32)
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
         self.asm = asm
         self.asm_se = asm_se  # has_side_effects on the asm MFMA (preserves program order for interleave)
+        self.packed = packed  # packed E8M0 scale + opsel-per-XDL (vs broadcast-dwordx4)
         self._zero4 = Vec.filled(4, 0, fx.Int32)
 
     def idx(self, i, j):
@@ -196,7 +353,18 @@ class MfmaScaleFp4:
 
     def call_subs(self, a, b, c, sa, sb, n_sub, use_asm=None):
         """Accumulate over n_sub 128-K sub-blocks. a[i][s]/b[j][s] nested frags;
-        sa[s]=n_tiles_a i32, sb[s]=n_tiles_b i32 (per-sub-block E8M0 scales)."""
+        sa[s]=n_tiles_a i32, sb[s]=n_tiles_b i32 (per-sub-block E8M0 scales).
+
+        packed mode: sa[s] is ONE packed i32 (byte t = A-tile t); sb[s] is a tuple
+        (packed_i32, opsel_b_base) -- A-tile i -> opsel_a=i, B-tile j -> base+j."""
+        if self.packed:
+            for s in range_constexpr(n_sub):
+                sb_p, ob = sb[s]
+                for i in range_constexpr(self.n_tiles_a):
+                    for j in range_constexpr(self.n_tiles_b):
+                        c[self.idx(i, j)] = self._do_packed(
+                            a[i][s], b[j][s], c[self.idx(i, j)], sa[s], i, sb_p, ob + j)
+            return c
         for s in range_constexpr(n_sub):
             a_s = [a[i][s] for i in range_constexpr(self.n_tiles_a)]
             b_s = [b[j][s] for j in range_constexpr(self.n_tiles_b)]
@@ -207,6 +375,23 @@ class MfmaScaleFp4:
         """Single (i,j) scaled MFMA — for the 4-warp interleaved cluster (BLOCK_K=128,
         flat a[i]/b[j] frags, sa[i]/sb[j] per-tile E8M0 scale)."""
         return self._do(a[i], b[j], c[self.idx(i, j)], sa[i], sb[j])
+
+    def _do_packed(self, a, b, c, sa_p, opsel_a, sb_p, opsel_b):
+        """PACKED-scale MFMA: one i32 scale operand holds n_tiles E8M0 (byte t = tile
+        t); opsel selects the byte for this XDL. cbsz=4/blgp=4 fp4. Intrinsic only
+        (a/b i32x8 padded by the S2R frag loader)."""
+        return rocdl.mfma_scale_f32_16x16x128_f8f6f4(
+            self.res_ty, [a, b, c, 4, 4, opsel_a, sa_p, opsel_b, sb_p])
+
+    def call_subs_packed(self, a, b, c, sa_p, sb_p, n_sub, opsel_b_base=0):
+        """Packed analog of call_subs. sa_p[s]/sb_p[s] are SINGLE packed i32 (per
+        sub-block); A-tile i -> opsel_a=i, B-tile j -> opsel_b=opsel_b_base+j."""
+        for s in range_constexpr(n_sub):
+            for i in range_constexpr(self.n_tiles_a):
+                for j in range_constexpr(self.n_tiles_b):
+                    c[self.idx(i, j)] = self._do_packed(
+                        a[i][s], b[j][s], c[self.idx(i, j)], sa_p[s], i, sb_p[s], opsel_b_base + j)
+        return c
 
 
 class Fp4FragLoader:
@@ -597,6 +782,9 @@ def compile_mxfp4_gemm_8w(
     group_n: int = 0,
     split_k: int = 1,
     wave_topo: str = "2x4",
+    const_scale: bool = False,
+    packed_scale: bool = True,
+    combine_a: bool = True,
 ):
     # block_k: logical fp4 contracted per K-iter. The 16x16x128 MFMA always does
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
@@ -616,6 +804,14 @@ def compile_mxfp4_gemm_8w(
     assert BLOCK_K % 128 == 0 and K % BLOCK_K == 0
 
     K_ITERS = K // BLOCK_K
+    # Packed E8M0 + opsel (4x less scale VMEM) is the default; auto-disable for the
+    # configs that can't express it (kv BN128, staged/direct, asm-MFMA, padded LDS,
+    # the const-scale diagnostic) so those silently keep the broadcast-dwordx4 path.
+    # Host must match via _packed_eligible() / preshuffle_mxfp4_scales().
+    packed_scale = _packed_eligible(mode, BLOCK_N, asm_mfma, padded) and not const_scale and packed_scale
+    # combine-A: both M-regions' packed scale in one coalesced dwordx2 (2 loads/iter
+    # instead of 3). Only with packed, BM256 (regular group structure).
+    combine_a = combine_a and packed_scale and BLOCK_M == 256
     assert split_k >= 1 and K_ITERS % split_k == 0, f"split_k {split_k} must divide K_ITERS {K_ITERS}"
     KI = K_ITERS // split_k  # per-split K-iterations (== K_ITERS when split_k==1)
     N_SUB = BLOCK_K // 128  # 128-K MFMA sub-blocks per K-iter
@@ -750,8 +946,17 @@ def compile_mxfp4_gemm_8w(
         # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
         # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
         _sa_q = 16 * SA_TILES
-        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
+        _sa_qd = ((c_m + _sa_q - 1) // _sa_q) * _sa_q
+        if const_expr(packed_scale):
+            # PACKED scale: n_tiles E8M0 in ONE i32 (byte t = tile t), opsel per-XDL
+            # (4x less scale VMEM vs broadcast). combine_a (python ternary, compile-time)
+            # = both M-regions' scale in one coalesced dwordx2 (2 loads/iter not 3).
+            sa_s2r = ScaleS2RPackedA2(A_scale, _sa_qd, K, SA_TILES) if combine_a \
+                else ScaleS2RPacked(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBCombPacked(B_scale, c_n, K)
+        else:
+            sa_s2r = ScaleS2R(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -1135,7 +1340,7 @@ def compile_mxfp4_gemm_8w(
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, asm=asm_mfma, asm_se=asm_se)
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, asm=asm_mfma, asm_se=asm_se, packed=packed_scale)
         if const_expr(padded):
             a_g2s = PaddedG2SLoader(A, c_m, K, lane_id, wave_id, N_LDS_STEPS_A, BPR, LDS_ROW_STRIDE)
             b_g2s = PaddedG2SLoader(B_T, c_n, K, lane_id, wave_id, N_LDS_STEPS_B, BPR, LDS_ROW_STRIDE)
@@ -1168,8 +1373,17 @@ def compile_mxfp4_gemm_8w(
         # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
         # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
         _sa_q = 16 * SA_TILES
-        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
+        _sa_qd = ((c_m + _sa_q - 1) // _sa_q) * _sa_q
+        if const_expr(packed_scale):
+            # PACKED scale: n_tiles E8M0 in ONE i32 (byte t = tile t), opsel per-XDL
+            # (4x less scale VMEM vs broadcast). combine_a (python ternary, compile-time)
+            # = both M-regions' scale in one coalesced dwordx2 (2 loads/iter not 3).
+            sa_s2r = ScaleS2RPackedA2(A_scale, _sa_qd, K, SA_TILES) if combine_a \
+                else ScaleS2RPacked(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBCombPacked(B_scale, c_n, K)
+        else:
+            sa_s2r = ScaleS2R(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -1190,10 +1404,37 @@ def compile_mxfp4_gemm_8w(
         # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s). _sb uses the
         # branch-free `load_halves` so BLOCK_N=128 (per-region) and BLOCK_N=256
         # (combined dwordx4) share one code path; BN256 packing is unchanged.
-        def _sa(base, kiter):
+        # combine-A cache: kiter -> [region0_dword, region1_dword] from the one
+        # coalesced dwordx2 load (reg0 issues+caches, reg1 reads).
+        _sa_a2_cache = {}
+
+        def _sa(base, kiter, reg=0):
+            # const_scale: PERF DIAGNOSTIC — feed identity E8M0 (0x7F7F7F7F) immediate,
+            # skip the scale buffer_loads entirely. Output is numerically wrong; used
+            # only to measure how much the scale-load path costs vs full pipe.
+            if const_expr(const_scale):
+                return [[0x7F7F7F7F] * SA_TILES for s in range_constexpr(N_SUB)]
+            if const_expr(combine_a):
+                # reg0 issues ONE coalesced dwordx2 (both M-regions) + caches by kiter;
+                # reg1 reads the cache (reg0 always precedes reg1 for a given kiter).
+                if const_expr(reg == 0):
+                    if const_expr(kiter not in _sa_a2_cache):
+                        _sa_a2_cache[kiter] = sa_s2r.load(base, kiter)
+                    return [_sa_a2_cache[kiter][0]]
+                return [_sa_a2_cache[kiter][1]]
+            # packed: each sub-block returns ONE packed i32 (n_tiles E8M0 in 4 bytes).
             return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
 
         def _sb(base, kiter):
+            if const_expr(const_scale):
+                cz = [[0x7F7F7F7F] * N_TILES_B for s in range_constexpr(N_SUB)]
+                return cz, cz
+            if const_expr(packed_scale):
+                # ONE packed i32/(k) holds b0 (bytes 0,1) + b1 (bytes 2,3); both
+                # N-halves share the dword, carrying the opsel base (0 vs 2) so the
+                # call sites stay unchanged (mfma.call_subs reads it when packed).
+                sp = [sb_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+                return [(sp[s], 0) for s in range_constexpr(N_SUB)], [(sp[s], 2) for s in range_constexpr(N_SUB)]
             pairs = [sb_s2r.load_halves(base, LDS_BLOCK_N, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
             return [pairs[s][0] for s in range_constexpr(N_SUB)], [pairs[s][1] for s in range_constexpr(N_SUB)]
 
@@ -1233,7 +1474,7 @@ def compile_mxfp4_gemm_8w(
             wait_barrier(0)  # BN128: conservative prologue drain
 
         sa0 = _sa(sa_base0, KO + 0)
-        sa1 = _sa(sa_base1, KO + 0)
+        sa1 = _sa(sa_base1, KO + 0, 1)
         sb0, sb1 = _sb(sb_base0, KO + 0)
 
         for k in range_constexpr(KI - 2):
@@ -1263,7 +1504,7 @@ def compile_mxfp4_gemm_8w(
 
             a1_frag = a_s2r.load(a_cur1)
             a_load(a_cur0, A0_off + (k + 2) * KSTEP)
-            sa1n = _sa(sa_base1, KO + k + 1)
+            sa1n = _sa(sa_base1, KO + k + 1, 1)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
@@ -1299,7 +1540,7 @@ def compile_mxfp4_gemm_8w(
         # Step k = K_ITERS - 2 (prefetch last iter)
         k = KI - 2
         sa0n = _sa(sa_base0, KO + KI - 1)
-        sa1n = _sa(sa_base1, KO + KI - 1)
+        sa1n = _sa(sa_base1, KO + KI - 1, 1)
         sb0n, sb1n = _sb(sb_base0, KO + KI - 1)
 
         b0_frag = b_s2r.load(b_cur0)
@@ -2164,8 +2405,17 @@ def compile_mxfp4_gemm_8w(
         # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
         # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
         _sa_q = 16 * SA_TILES
-        sa_s2r = ScaleS2R(A_scale, ((c_m + _sa_q - 1) // _sa_q) * _sa_q, K, SA_TILES)
-        sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
+        _sa_qd = ((c_m + _sa_q - 1) // _sa_q) * _sa_q
+        if const_expr(packed_scale):
+            # PACKED scale: n_tiles E8M0 in ONE i32 (byte t = tile t), opsel per-XDL
+            # (4x less scale VMEM vs broadcast). combine_a (python ternary, compile-time)
+            # = both M-regions' scale in one coalesced dwordx2 (2 loads/iter not 3).
+            sa_s2r = ScaleS2RPackedA2(A_scale, _sa_qd, K, SA_TILES) if combine_a \
+                else ScaleS2RPacked(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBCombPacked(B_scale, c_n, K)
+        else:
+            sa_s2r = ScaleS2R(A_scale, _sa_qd, K, SA_TILES)
+            sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
         store_c = (StoreCAtomic if split_k > 1 else StoreCPlain)(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)

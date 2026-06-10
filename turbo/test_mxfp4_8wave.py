@@ -25,7 +25,7 @@ for p in (_REPO_ROOT, _PYFLYDSL_SRC):
 import flydsl.compiler as flyc  # noqa: E402
 from flydsl.runtime.device import get_rocm_arch  # noqa: E402
 from tests.kernels.utils import fp4_utils  # noqa: E402
-from turbo.mxfp4_gemm_8wave import compile_mxfp4_gemm_8w  # noqa: E402
+from turbo.mxfp4_gemm_8wave import compile_mxfp4_gemm_8w, preshuffle_mxfp4_scales  # noqa: E402
 from turbo.mxfp8_gemm_8wave import preshuffle_scale, preshuffle_scale_b_comb  # noqa: E402
 
 SCALE_BLOCK = 32
@@ -72,16 +72,17 @@ def run(M=256, N=256, K=512, BLOCK_M=256, BLOCK_N=256):
 
     ref = reference_mxfp4_gemm(a_u8, b_u8, a_sc_u8, b_sc_u8, M, N, K)
 
-    a_sc_i32 = preshuffle_scale(a_sc_u8, K, BLOCK_M // 64)
-    b_sc_i32 = preshuffle_scale_b_comb(b_sc_u8, K)
-
     mode = os.environ.get("FP4_MODE", "direct")
     block_k = int(os.environ.get("FP4_BLOCK_K", "128"))
     pad = int(os.environ.get("FP4_PAD", "0"))
+    asm_mfma = int(os.environ.get("FP4_ASM", "0")) > 0
+    # Host scale prep matches the kernel's chosen layout (packed for eligible pipe).
+    a_sc_i32, b_sc_i32 = preshuffle_mxfp4_scales(
+        a_sc_u8, b_sc_u8, K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, mode=mode, asm_mfma=asm_mfma, padded=pad > 0)
     c_out = torch.zeros((M, N), dtype=torch.bfloat16, device=dev)
     launch_fn = compile_mxfp4_gemm_8w(
         K=K, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, mode=mode, block_k=block_k, padded=pad > 0, pad_bytes=max(pad, 16),
-        asm_mfma=int(os.environ.get("FP4_ASM", "0")) > 0, asm_se=int(os.environ.get("FP4_SE", "0")) > 0, frag_pad=int(os.environ.get("FP4_NOPAD","0"))==0, sched=int(os.environ.get("FP4_SCHED","0"))>0, iglp=int(os.environ.get("FP4_IGLP","0"))>0,
+        asm_mfma=asm_mfma, asm_se=int(os.environ.get("FP4_SE", "0")) > 0, frag_pad=int(os.environ.get("FP4_NOPAD","0"))==0, sched=int(os.environ.get("FP4_SCHED","0"))>0, iglp=int(os.environ.get("FP4_IGLP","0"))>0,
     )
 
     def _args(c, a, b, sa, sb):
