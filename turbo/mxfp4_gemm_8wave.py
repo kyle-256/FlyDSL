@@ -14,6 +14,7 @@ bytes [k*64 + g*16 ..]. Operand is i32x8 with low 16B real + upper 16B zero.
 Scale path is IDENTICAL to mxfp8 (per-1x32 E8M0, 4 blocks/mfma) -- reused.
 """
 
+import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
@@ -35,6 +36,16 @@ def wait_lgkm():
     complete before a G2S buffer_load_lds overwrites the same LDS slot (WAR),
     while still letting the async G2S overlap the following MFMAs."""
     _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
+                     constraints="", has_side_effects=True)
+
+
+def wait_vmcnt(n):
+    """Graded VMEM wait (s_waitcnt vmcnt(n)) WITHOUT a WG barrier -- the async
+    DMA scoreboard. raw_buffer_load_lds (G2S) completes on vmcnt; vmcnt(n) blocks
+    until <= n G2S loads are still in flight, letting the async copies overlap the
+    MFMAs (= the competitor's commit_group/wait_group(n) cadence). Pure counter
+    wait, no cross-wave sync -- pair with one s_barrier per iter for the WAR/RAW."""
+    _llvm.inline_asm(res=None, operands_=[], asm_string=f"s_waitcnt vmcnt({n})",
                      constraints="", has_side_effects=True)
 
 
@@ -948,6 +959,132 @@ def compile_mxfp4_gemm_8w(
         B_s2_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
+    def kernel_gemm_pipea(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+    ):
+        # ASYNC double-buffer pipe (bulk BM256/BN256). vs `pipe`: the K-loop's 8
+        # WG s_barrier/iter come from interleaving G2S writes into the MFMA cluster
+        # (in-place recycle of cur). Here the structure mirrors the competitor
+        # (gluon a4w4): read cur's 4 fragments, run all 4 MFMA clusters back-to-back,
+        # then ONE s_barrier (WAR: all waves done reading cur), then issue the iter
+        # k+2 G2S async into cur (overlaps the NEXT iter's S2R+MFMA), swap. The async
+        # raw_buffer_load_lds completes on vmcnt; wait_vmcnt(0) before the barrier is
+        # the scoreboard drain. -> ~1 s_barrier/iter instead of 8. Bulk only (no
+        # BN128/BM192/split_k machinery). correctness-first (wait_vmcnt(0) full drain;
+        # relax to graded later by det0).
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+        lds = fx.SharedAllocator().allocate(SharedStorageFp4Pipe).peek()
+        a_cur0 = lds.A_lds_cur_0; a_cur1 = lds.A_lds_cur_1
+        a_next0 = lds.A_lds_next_0; a_next1 = lds.A_lds_next_1
+        b_cur0 = lds.B_lds_cur_0; b_cur1 = lds.B_lds_cur_1
+        b_next0 = lds.B_lds_next_0; b_next1 = lds.B_lds_next_1
+
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        block_m, block_n = grouped_xcd_pid(fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N,
+                                           group_m=group_m, num_xcds=num_xcds, group_n=group_n)
+        A0_off = block_m * BLOCK_M * K2
+        A1_off = (block_m * BLOCK_M + LDS_BLOCK_M) * K2
+        B0_off = block_n * BLOCK_N * K2
+        B1_off = (block_n * BLOCK_N + LDS_BLOCK_N) * K2
+
+        gA = make_fp8_buffer_tensor(A, F8_IR_t)
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=frag_pad)
+        sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+        sb_s2r = ScaleBComb(B_scale, c_n, K)
+        store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+        sa_base0 = fx.Int32(block_m * BLOCK_M + wave_m_offset)
+        sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
+        sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
+
+        def _sa(base, kiter):
+            return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+
+        def _sb(base, kiter):
+            alls = [sb_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
+            return [alls[s][0:2] for s in range_constexpr(N_SUB)], [alls[s][2:4] for s in range_constexpr(N_SUB)]
+
+        c00_frag = [mfma.zero_value] * N_ACCUMS
+        c01_frag = [mfma.zero_value] * N_ACCUMS
+        c10_frag = [mfma.zero_value] * N_ACCUMS
+        c11_frag = [mfma.zero_value] * N_ACCUMS
+
+        # Prologue: async G2S iter0 -> buf0(cur), iter1 -> buf1(next), drain+barrier.
+        b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
+        a_g2s.load(a_cur0, A0_off + 0 * KSTEP)
+        b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
+        a_g2s.load(a_cur1, A1_off + 0 * KSTEP)
+        b_g2s.load(b_next0, B0_off + 1 * KSTEP)
+        a_g2s.load(a_next0, A0_off + 1 * KSTEP)
+        b_g2s.load(b_next1, B1_off + 1 * KSTEP)
+        a_g2s.load(a_next1, A1_off + 1 * KSTEP)
+        wait_vmcnt(0)
+        rocdl.s_barrier()
+
+        for k in range_constexpr(KI):
+            sa0 = _sa(sa_base0, k)
+            sa1 = _sa(sa_base1, k)
+            sb0, sb1 = _sb(sb_base0, k)
+            # Interleave S2R with MFMA (overlap LDS-read latency under MFMA, like
+            # `pipe`), but with NO mid-cluster s_barrier and G2S fully async-batched
+            # at the end (overlaps next iter). setprio per cluster keeps MFMA issue
+            # priority. 1 s_barrier + 1 vmcnt-drain per iter (vs pipe's 8 barriers).
+            b0_frag = b_s2r.load(b_cur0)
+            a0_frag = a_s2r.load(a_cur0)
+            rocdl.s_setprio(1)
+            c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB, False)
+            rocdl.s_setprio(0)
+            b1_frag = b_s2r.load(b_cur1)
+            rocdl.s_setprio(1)
+            c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB, False)
+            rocdl.s_setprio(0)
+            a1_frag = a_s2r.load(a_cur1)
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB, False)
+            c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB, False)
+            rocdl.s_setprio(0)
+
+            wait_vmcnt(0)          # drain in-flight G2S (prev iter's k+2 batch)
+            rocdl.s_barrier()      # WAR: all waves done S2R cur; RAW: prev G2S visible
+            if const_expr(k + 2 < KI):
+                b_g2s.load(b_cur0, B0_off + (k + 2) * KSTEP)
+                a_g2s.load(a_cur0, A0_off + (k + 2) * KSTEP)
+                b_g2s.load(b_cur1, B1_off + (k + 2) * KSTEP)
+                a_g2s.load(a_cur1, A1_off + (k + 2) * KSTEP)
+            a_cur0, a_next0 = a_next0, a_cur0
+            a_cur1, a_next1 = a_next1, a_cur1
+            b_cur0, b_next0 = b_next0, b_cur0
+            b_cur1, b_next1 = b_next1, b_cur1
+
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
+    @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm_pipe(
         A: fx.Tensor,
         B_T: fx.Tensor,
@@ -1329,6 +1466,12 @@ def compile_mxfp4_gemm_8w(
         sa1 = _sa(sa_base1, 0)
         sb0, sb1 = _sb(sb_base0, 0)
 
+        # PA_BAR = how many of the 4 per-cluster s_barriers to keep (det0-bisect knob:
+        # 4 = original r8_2 correct baseline; reduce toward 1 watching det0). PA_VMCNT
+        # = the end-of-iter drain depth (0 = full drain / correct; >0 = graded async,
+        # the speedup but needs cross-wave visibility to still hold).
+        _pav = int(os.environ.get("FP4_PA_VMCNT", "0"))
+        _pab = int(os.environ.get("FP4_PA_BAR", "4"))
         for k in range_constexpr(KI):
             cur = k % 3
             n2 = (k + 2) % 3
@@ -1340,7 +1483,8 @@ def compile_mxfp4_gemm_8w(
             a0_frag = a_s2r.load(A_lds[cur][0])
             if const_expr(k + 2 < KI):
                 a_g2s.load(A_lds[n2][1], A1_off + (k + 2) * KSTEP)
-            rocdl.s_barrier()
+            if const_expr(_pab >= 1):
+                rocdl.s_barrier()
             rocdl.s_setprio(1)
             c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB, ua)
             rocdl.s_setprio(0)
@@ -1351,7 +1495,8 @@ def compile_mxfp4_gemm_8w(
                 b_g2s.load(B_lds[n2][0], B0_off + (k + 2) * KSTEP)
             if const_expr(k + 1 < KI):
                 sb0n, sb1n = _sb(sb_base0, k + 1)
-            rocdl.s_barrier()
+            if const_expr(_pab >= 2):
+                rocdl.s_barrier()
             rocdl.s_setprio(1)
             c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB, ua)
             rocdl.s_setprio(0)
@@ -1362,7 +1507,8 @@ def compile_mxfp4_gemm_8w(
                 a_g2s.load(A_lds[n2][0], A0_off + (k + 2) * KSTEP)
             if const_expr(k + 1 < KI):
                 sa1n = _sa(sa_base1, k + 1)
-            rocdl.s_barrier()
+            if const_expr(_pab >= 3):
+                rocdl.s_barrier()
             rocdl.s_setprio(1)
             c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB, ua)
             rocdl.s_setprio(0)
@@ -1370,7 +1516,8 @@ def compile_mxfp4_gemm_8w(
 
             if const_expr(k + 2 < KI):
                 b_g2s.load(B_lds[n2][1], B1_off + (k + 2) * KSTEP)
-            wait_barrier(0)
+            wait_vmcnt(_pav)
+            rocdl.s_barrier()
             rocdl.s_setprio(1)
             c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB, ua)
             rocdl.s_setprio(0)
@@ -2072,7 +2219,7 @@ def compile_mxfp4_gemm_8w(
     ):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N) * split_k
         kern = {"staged": kernel_gemm_staged, "pipe": kernel_gemm_pipe, "pipeh": kernel_gemm_pipeh,
-                "pipe3": kernel_gemm_pipe3,
+                "pipe3": kernel_gemm_pipe3, "pipea": kernel_gemm_pipea,
                 "pipeb": kernel_gemm_pipeb,
                 "il": kernel_gemm_il, "rt": kernel_gemm_rt, "rt2": kernel_gemm_rt2}.get(mode, kernel_gemm)
         kern(
