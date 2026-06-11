@@ -423,7 +423,29 @@ class Fp4FragLoader:
         return out
 
 
-def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
+def _swz_fwd(c):
+    """LDS bank-swizzle, logical chunk -> physical slot. Modular-add rotate within
+    each 1024B block: phase = c//8 (= row//2, the 128B-line index within the block,
+    max_phase 8), rotate the low 3 bits (the 8-chunk = 128B bank period) by phase.
+    The 8 same-bank rows of one ds_read_b128 (which collide in identity layout) then
+    land on all 8 bank-groups. Bijection; involution-free, so G2S uses _swz_inv.
+    Direct-DMA safe (it permutes the lane<->gmem assignment, footprint/stride/coalesce
+    unchanged) -- unlike PaddedG2SLoader which changes the row stride (needs 2-hop).
+    n_sub-agnostic (applied on the cib = byte-offset chunk index, so it covers BK128's
+    8-way AND BK256's 16-way (128B row-stride == bank period) ds_read conflict)."""
+    ph = c // 8
+    return ph * 8 + (c % 8 + ph) % 8
+
+
+def _swz_inv(c):
+    """Inverse of _swz_fwd (physical slot -> logical chunk). G2S lane L writes the
+    contiguous physical slot L, so it must fetch the gmem of logical chunk _swz_inv(L)
+    for S2R's _swz_fwd read to land on it."""
+    ph = c // 8
+    return ph * 8 + (c % 8 + 8 - ph) % 8
+
+
+def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row, swizzle=False):
     """Per-lane gmem byte offsets for fp4 G2S (identity LDS layout, no swizzle).
 
     A K-iter row is BLOCK_K fp4 == bytes_per_row packed bytes == (bpr/16) lanes
@@ -439,8 +461,9 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
     rows_per_step = 64 // lpr
     offs = []
     for r in range_constexpr(n_steps):
-        row = lane_id // lpr + wave_id * rows_per_step + r * (n_waves * rows_per_step)
-        chunk = lane_id % lpr
+        cib = _swz_inv(lane_id) if swizzle else lane_id  # physical slot -> logical chunk
+        row = cib // lpr + wave_id * rows_per_step + r * (n_waves * rows_per_step)
+        chunk = cib % lpr
         offs.append(row * (K // 2) + chunk * 16)
     return offs
 
@@ -448,7 +471,8 @@ def fp4_g2s_offsets(lane_id, wave_id, K, n_steps, bytes_per_row):
 def recommend_config(M, N, K):
     """Data-driven production config for dense mxfp4 (mode=pipe) on MI355X.
 
-    Returns (BLOCK_M, BLOCK_N, group_m, group_n, num_xcds). Verified-solid levers:
+    Returns (BLOCK_M, BLOCK_N, group_m, group_n, num_xcds, block_k, swizzle).
+    Verified-solid levers:
 
     - BLOCK_N = 128 for grid-underfilled (narrow-N kv) shapes: when the BLOCK_N=256
       grid has fewer tiles than the 256 active CUs, halving N doubles the N-tiles and
@@ -536,7 +560,16 @@ def recommend_config(M, N, K):
     # permutation (bit-exact, det-neutral). kv M8192 stays BM256/gm2 (r26, unchanged).
     if block_m == 128:
         group_m = 8
-    return block_m, block_n, group_m, group_n, num_xcds
+    # BK256 + LDS bank-swizzle (BN256 bulk only): BK256 (n_sub=2) amortizes the per-iter
+    # G2S-setup MFMA-bubble (G2S cost 28%->11%), but its 128B LDS row-stride == bank
+    # period -> 16-way ds_read bank conflict (57% GPUTime stall); the swizzle kills it
+    # (3.0->0.0 conf/access). Neither alone helps bulk; COMBINED = real-scale +7.5~14.5%
+    # across all BN256 shapes (8192^2 K28672 4280->4905, bit-exact, no-G2S ceiling 6165).
+    # BN128 (narrow kv) stays BK128/no-swizzle (swizzle asserts BN256; BK256 doubles LDS
+    # and the narrow grid is occupancy- not bubble-bound). See feedback memory 2026-06-11.
+    block_k = 256 if block_n == 256 else 128
+    swizzle = block_n == 256
+    return block_m, block_n, group_m, group_n, num_xcds, block_k, swizzle
 
 
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
@@ -648,7 +681,7 @@ class S2RLoaderFp4:
     ``load`` returns frag[tile][sub] (nested).
     """
 
-    def __init__(self, wave_idx, n_tiles, n_sub, bytes_per_row, row_stride=None, pad=True):
+    def __init__(self, wave_idx, n_tiles, n_sub, bytes_per_row, row_stride=None, pad=True, swizzle=False):
         self.lane16 = fx.thread_idx.x % 16
         self.g = (fx.thread_idx.x % 64) // 16
         self.wave_idx = wave_idx
@@ -657,6 +690,7 @@ class S2RLoaderFp4:
         self.bpr = bytes_per_row
         self.row_stride = row_stride if row_stride is not None else bytes_per_row
         self.pad = pad  # False -> return raw i32x4 (for inline-asm MFMA; fp4 HW needs only 16B)
+        self.swizzle = swizzle  # bank-swizzle read offset (pairs with G2S _swz_inv); BK128+BK256
         self.zero4 = Vec.filled(4, 0, fx.Int32)
 
     def _load16(self, lds_src, off_bytes):
@@ -672,11 +706,319 @@ class S2RLoaderFp4:
             row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane16
             subs = []
             for s in range_constexpr(self.n_sub):
-                off = row * self.row_stride + s * 64 + self.g * 16
+                if const_expr(self.swizzle):
+                    # General byte-offset swizzle (n_sub-agnostic): permute 16B chunks
+                    # within each 1024B (8-bank-period) block. Works for BK128
+                    # (row_stride=64 -> 16 rows x 4 chunks) AND BK256 (row_stride=128 ->
+                    # 8 rows x 8 chunks, where 128B stride == bank period = 16-way
+                    # conflict that this kills). cib//8 = row-within-block = phase.
+                    off_nat = row * self.row_stride + s * 64 + self.g * 16
+                    cib = (off_nat % 1024) // 16
+                    off = (off_nat // 1024) * 1024 + _swz_fwd(cib) * 16
+                else:
+                    off = row * self.row_stride + s * 64 + self.g * 16
                 v4 = self._load16(lds_src, off).bitcast(fx.Int32)
                 subs.append(v4 if not self.pad else pack_i32x4_i32x8(v4, self.zero4))
             frag.append(subs)
         return frag
+
+    def addr(self, lds_src, s=0):
+        """LDS byte-address (i32 ptrtoint) of each tile's sub-block-`s` fragment, for
+        feeding ds_read into an inline-asm MFMA cluster. Mirrors load()'s offset."""
+        out = []
+        for i in range_constexpr(self.n_tiles):
+            row = self.wave_idx * (self.n_tiles * 16) + i * 16 + self.lane16
+            off = row * self.row_stride + s * 64 + self.g * 16
+            i8_iter = fx.recast_iter(fx.Uint8, fx.add_offset(lds_src.ptr, fx.make_int_tuple(off)))
+            out.append(fx.ptrtoint(i8_iter))
+        return out
+
+    def base_addr(self, lds_src, s=0):
+        """Single base LDS address (tile 0, sub-block s). Per-tile fragments are at
+        base + i*tile_stride (tile_stride = 16*row_stride bytes) -> the asm uses ONE
+        address reg per region + a ds_read offset immediate, instead of n_tiles full
+        address regs (cuts the address-register VGPR pressure that caused spill)."""
+        row0 = self.wave_idx * (self.n_tiles * 16) + self.lane16
+        off = row0 * self.row_stride + s * 64 + self.g * 16
+        i8_iter = fx.recast_iter(fx.Uint8, fx.add_offset(lds_src.ptr, fx.make_int_tuple(off)))
+        return fx.ptrtoint(i8_iter)
+
+    @property
+    def tile_stride(self):
+        return 16 * self.row_stride
+
+
+_ASM_CL_MFMA = ("v_mfma_scale_f32_16x16x128_f8f6f4 ${d}, ${a}, ${b}, ${c}, ${sa}, ${sb} "
+                "op_sel_hi:[0,0,0] cbsz:4 blgp:4")
+# DIAGNOSTIC: unscaled fp4 MFMA (no per-block scale operand) to measure whether the
+# v_mfma_SCALE instruction throughput is itself the ~4400 scale-free ceiling.
+_ASM_CL_MFMA_NS = "v_mfma_f32_16x16x128_f8f6f4 ${d}, ${a}, ${b}, ${c} cbsz:4 blgp:4"
+_USE_NS_MFMA = __import__("os").environ.get("FP4_NOSCALE_MFMA", "0") == "1"
+
+
+def _asm_cluster32_layout(acc_agpr=True):
+    """One K-iter monolithic asm: 8 A-frag + 4 B-frag ds_read_b128, ONE lgkmcnt(0),
+    then 32 MFMAs (c00/c01/c10/c11 = a0xb0 / a0xb1 / a1xb0 / a1xb1, each 4 A-tiles x
+    2 B-tiles) accumulating into resident AGPR. No inter-cluster s_barrier / setprio.
+    Scales are register INPUTS (sa[8] per A-tile, sb[4] per B-tile; opsel 0).
+    Replaces production's 4 call_subs + 7 s_barrier -> 1 read-stall, 0 barriers.
+
+    Operand order: A addrs[8] = a0[0..3]+a1[0..3]; B addrs[4] = b0[0..1]+b1[0..1].
+    acc q in [0,32): q//8 = quad(0=00,1=01,2=10,3=11); within quad t in [0,8):
+    A_idx = (quad//2)*4 + t//2 ; B_idx = (quad%2)*2 + t%2."""
+    NACC, NA, NB = 32, 8, 4
+    b = 0
+    o_acc = list(range(b, b + NACC)); b += NACC
+    o_af = list(range(b, b + NA)); b += NA
+    o_bf = list(range(b, b + NB)); b += NB
+    n_out = b
+    i_aa = n_out; i_ba = i_aa + NA; i_sa = i_ba + NB; i_sb = i_sa + NA
+    acc_c = "=a" if acc_agpr else "=v"
+    out_cons = [acc_c] * NACC + ["=&v"] * (NA + NB)
+    in_cons = ["v"] * (NA + NB) + ["v"] * (NA + NB) + [str(q) for q in o_acc]
+    cons = ",".join(out_cons + in_cons)
+    out_types = ["vector<4xf32>"] * NACC + ["vector<4xi32>"] * (NA + NB)
+    st_str = "!llvm.struct<(" + ", ".join(out_types) + ")>"
+    L = []
+    for i in range(NA): L.append(f"ds_read_b128 ${o_af[i]}, ${i_aa + i}")
+    for j in range(NB): L.append(f"ds_read_b128 ${o_bf[j]}, ${i_ba + j}")
+    L.append("s_waitcnt lgkmcnt(0)")
+    for quad in range(4):
+        for t in range(8):
+            q = quad * 8 + t
+            ai = (quad // 2) * 4 + t // 2
+            bj = (quad % 2) * 2 + t % 2
+            L.append(_ASM_CL_MFMA.format(d=o_acc[q], a=o_af[ai], b=o_bf[bj],
+                                         c=o_acc[q], sa=i_sa + ai, sb=i_sb + bj))
+    return "\n".join(L), cons, st_str
+
+
+def asm_cluster32(a_ad, b_ad, sa, sb, acc, res4, acc_agpr=True, _cache={}):
+    """Emit the monolithic 32-MFMA cluster. a_ad[8]/b_ad[4]: LDS i32 addresses;
+    sa[8]/sb[4]: per-tile scale i32 (raw); acc[32]: tied acc-in (raw vec4f32).
+    Returns 32 vec4f32 (raw)."""
+    key = acc_agpr
+    if key not in _cache:
+        _cache[key] = _asm_cluster32_layout(acc_agpr)
+    asm, cons, st_str = _cache[key]
+    ins = ([_raw(x) for x in a_ad] + [_raw(x) for x in b_ad]
+           + [_raw(x) for x in sa] + [_raw(x) for x in sb] + [_raw(acc[q]) for q in range(32)])
+    r = _llvm.inline_asm(ir.Type.parse(st_str), ins, asm, cons, has_side_effects=True)
+    return [_llvm.extractvalue(_raw(res4), r, [q]) for q in range(32)]
+
+
+def _asm_read12_layout(tile_stride, _c={}):
+    """Prologue: issue 8 A + 4 B ds_read_b128 (no wait) -> 12 frags, base-addressed
+    (4 base addrs + per-tile offset immediates). in: a0,a1,b0,b1 base."""
+    if tile_stride in _c:
+        return _c[tile_stride]
+    NF = 12
+    cons = ",".join(["=&v"] * NF + ["v"] * 4)
+    st = "!llvm.struct<(" + ", ".join(["vector<4xi32>"] * NF) + ")>"
+    ia0, ia1, ib0, ib1 = NF, NF + 1, NF + 2, NF + 3
+    L = []
+    for i in range(4): L.append(f"ds_read_b128 ${i}, ${ia0} offset:{i * tile_stride}")
+    for i in range(4): L.append(f"ds_read_b128 ${4 + i}, ${ia1} offset:{i * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${8 + j}, ${ib0} offset:{j * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${10 + j}, ${ib1} offset:{j * tile_stride}")
+    _c[tile_stride] = ("\n".join(L), cons, st)
+    return _c[tile_stride]
+
+
+def asm_read12(a0_base, a1_base, b0_base, b1_base, tile_stride):
+    """Issue the 12 (8 A + 4 B) fragment ds_reads (base-addressed), return 12 raw
+    vec4i32 (no wait). Primes the cross-iter pipeline (block 0)."""
+    asm, cons, st = _asm_read12_layout(tile_stride)
+    ins = [_raw(a0_base), _raw(a1_base), _raw(b0_base), _raw(b1_base)]
+    r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+    vt = ir.Type.parse("vector<4xi32>")
+    return [_llvm.extractvalue(vt, r, [i]) for i in range(12)]
+
+
+def _asm_cluster32_pipe_layout(tile_stride, acc_agpr=True, _c={}):
+    """Cross-iter pipelined cluster (lgkmcnt-depth-safe), base-addressed. Wait for the
+    PREVIOUS iter's reads (cur frags, long done), THEN issue this iter's 12 next-frag
+    ds_reads using 4 BASE addrs (a0,a1,b0,b1) + per-tile offset immediates (i*tile_
+    stride) -- ONE addr reg/region not 12 (kills the address-reg spill), THEN 32 MFMAs
+    on CUR frags. Peak outstanding LDS reads == 12. Outputs acc(32) + frags_next(12 =&v);
+    inputs a0/a1/b0/b1 base(4) + sa(8) + sb(4) + cur_frag(12) + acc(32 tie)."""
+    key = (tile_stride, acc_agpr)
+    if key in _c:
+        return _c[key]
+    NACC, NF = 32, 12
+    o_acc = list(range(NACC))
+    o_fn = list(range(NACC, NACC + NF)); n_out = NACC + NF
+    i_a0 = n_out; i_a1 = i_a0 + 1; i_b0 = i_a1 + 1; i_b1 = i_b0 + 1
+    i_sa = i_b1 + 1; i_sb = i_sa + 8; i_cf = i_sb + 4
+    acc_c = "=a" if acc_agpr else "=v"
+    out_cons = [acc_c] * NACC + ["=&v"] * NF
+    in_cons = ["v"] * 4 + ["v"] * 8 + ["v"] * 4 + ["v"] * 12 + [str(q) for q in o_acc]
+    cons = ",".join(out_cons + in_cons)
+    st = "!llvm.struct<(" + ", ".join(["vector<4xf32>"] * NACC + ["vector<4xi32>"] * NF) + ")>"
+    L = ["s_waitcnt lgkmcnt(0)"]                                  # drain prev (cur frags)
+    # A region 0 (frags 0..3) <- a0_base; region 1 (4..7) <- a1_base; offset = tile*stride
+    for i in range(4): L.append(f"ds_read_b128 ${o_fn[i]}, ${i_a0} offset:{i * tile_stride}")
+    for i in range(4): L.append(f"ds_read_b128 ${o_fn[4 + i]}, ${i_a1} offset:{i * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${o_fn[8 + j]}, ${i_b0} offset:{j * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${o_fn[10 + j]}, ${i_b1} offset:{j * tile_stride}")
+    for quad in range(4):
+        for t in range(8):
+            q = quad * 8 + t
+            ai = (quad // 2) * 4 + t // 2
+            bj = (quad % 2) * 2 + t % 2
+            if _USE_NS_MFMA:
+                L.append(_ASM_CL_MFMA_NS.format(d=o_acc[q], a=i_cf + ai, b=i_cf + 8 + bj, c=o_acc[q]))
+            else:
+                L.append(_ASM_CL_MFMA.format(d=o_acc[q], a=i_cf + ai, b=i_cf + 8 + bj,
+                                             c=o_acc[q], sa=i_sa + ai, sb=i_sb + bj))
+    _c[key] = ("\n".join(L), cons, st)
+    return _c[key]
+
+
+def _asm_cluster32_pipe_g2s_layout(tile_stride, acc_agpr=True, _c={}):
+    """Like _asm_cluster32_pipe_layout but ALSO emits 4 buffer_load_lds (G2S) in the
+    asm text -- one after each 8-MFMA quad -- so the gmem->LDS copy co-issues with the
+    matrix unit (SALU/VMEM run parallel to MFMA), recovering the ~24% G2S cost that the
+    out-of-asm (gap) G2S exposed. Loads: b0,a0,b1,a1 (rsrc_b,rsrc_a alternating).
+    Inputs: a0/a1/b0/b1 base(4) + sa(8) + sb(4) + cur_frag(12) + rsrc_a + rsrc_b +
+    voff(4) + m0(4) + acc(32 tie)."""
+    key = (tile_stride, acc_agpr)
+    if key in _c:
+        return _c[key]
+    NACC, NF = 32, 12
+    o_acc = list(range(NACC)); o_fn = list(range(NACC, NACC + NF)); n_out = NACC + NF
+    i_a0 = n_out; i_a1 = i_a0 + 1; i_b0 = i_a1 + 1; i_b1 = i_b0 + 1
+    i_sa = i_b1 + 1; i_sb = i_sa + 8; i_cf = i_sb + 4
+    i_rsa = i_cf + 12; i_rsb = i_rsa + 1; i_voff = i_rsb + 1; i_m0 = i_voff + 4
+    acc_c = "=a" if acc_agpr else "=v"
+    out_cons = [acc_c] * NACC + ["=&v"] * NF
+    in_cons = (["v"] * 4 + ["v"] * 8 + ["v"] * 4 + ["v"] * 12
+               + ["s", "s"] + ["v"] * 4 + ["s"] * 4 + [str(q) for q in o_acc])
+    cons = ",".join(out_cons + in_cons)
+    st = "!llvm.struct<(" + ", ".join(["vector<4xf32>"] * NACC + ["vector<4xi32>"] * NF) + ")>"
+    L = ["s_waitcnt lgkmcnt(0)"]
+    for i in range(4): L.append(f"ds_read_b128 ${o_fn[i]}, ${i_a0} offset:{i * tile_stride}")
+    for i in range(4): L.append(f"ds_read_b128 ${o_fn[4 + i]}, ${i_a1} offset:{i * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${o_fn[8 + j]}, ${i_b0} offset:{j * tile_stride}")
+    for j in range(2): L.append(f"ds_read_b128 ${o_fn[10 + j]}, ${i_b1} offset:{j * tile_stride}")
+    g2s_rsrc = [i_rsb, i_rsa, i_rsb, i_rsa]   # load order b0,a0,b1,a1
+    # issue the 4 buffer_loads spread over quads [AFTER..3] (1 per quad from AFTER on,
+    # remainder bunched after quad3). AFTER=0 == fully early (racy); 3 == all at end.
+    _after = int(__import__("os").environ.get("FP4_G2S_AFTER", "3"))
+    sched = {}                      # quad -> list of load indices to emit after it
+    nq = 4 - _after
+    for li in range(4):
+        q = _after + min(li, nq - 1) if nq > 0 else 3
+        sched.setdefault(q, []).append(li)
+    for quad in range(4):
+        for t in range(8):
+            q = quad * 8 + t
+            ai = (quad // 2) * 4 + t // 2
+            bj = (quad % 2) * 2 + t % 2
+            if _USE_NS_MFMA:
+                L.append(_ASM_CL_MFMA_NS.format(d=o_acc[q], a=i_cf + ai, b=i_cf + 8 + bj, c=o_acc[q]))
+            else:
+                L.append(_ASM_CL_MFMA.format(d=o_acc[q], a=i_cf + ai, b=i_cf + 8 + bj,
+                                             c=o_acc[q], sa=i_sa + ai, sb=i_sb + bj))
+        for li in sched.get(quad, []):
+            L.append(f"s_mov_b32 m0, ${i_m0 + li}")
+            L.append(f"buffer_load_dwordx4 ${i_voff + li}, ${g2s_rsrc[li]}, 0 offen lds")
+    _c[key] = ("\n".join(L), cons, st)
+    return _c[key]
+
+
+def asm_cluster32_pipe_g2s(a0_base, a1_base, b0_base, b1_base, tile_stride, sa, sb,
+                           cur_frag, acc, res4, rsrc_a, rsrc_b, voffs, m0s, acc_agpr=True):
+    """Pipelined cluster with the 4 G2S buffer_loads interleaved IN the asm (co-issue).
+    voffs[4]=per-lane global byte offsets (b0,a0,b1,a1); m0s[4]=LDS dest (readfirstlane)."""
+    asm, cons, st = _asm_cluster32_pipe_g2s_layout(tile_stride, acc_agpr)
+    ins = ([_raw(a0_base), _raw(a1_base), _raw(b0_base), _raw(b1_base)]
+           + [_raw(x) for x in sa] + [_raw(x) for x in sb] + [_raw(x) for x in cur_frag]
+           + [_raw(rsrc_a), _raw(rsrc_b)] + [_raw(x) for x in voffs] + [_raw(x) for x in m0s]
+           + [_raw(acc[q]) for q in range(32)])
+    r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+    accs = [_llvm.extractvalue(_raw(res4), r, [q]) for q in range(32)]
+    vt = ir.Type.parse("vector<4xi32>")
+    return accs, [_llvm.extractvalue(vt, r, [32 + i]) for i in range(12)]
+
+
+def asm_cluster32_pipe(a0_base, a1_base, b0_base, b1_base, tile_stride, sa, sb, cur_frag, acc, res4, acc_agpr=True):
+    """One pipelined K-iter, base-addressed. a0/a1/b0/b1_base: per-region LDS base
+    addr for iter k+1's frags (tile i at base + i*tile_stride); sa[8]/sb[4]: CUR
+    block scales; cur_frag[12]=8 A+4 B raw vec4i32 (iter k); acc[32] tied. Returns
+    (acc[32], frags_next[12])."""
+    asm, cons, st = _asm_cluster32_pipe_layout(tile_stride, acc_agpr)
+    ins = ([_raw(a0_base), _raw(a1_base), _raw(b0_base), _raw(b1_base)]
+           + [_raw(x) for x in sa] + [_raw(x) for x in sb]
+           + [_raw(x) for x in cur_frag] + [_raw(acc[q]) for q in range(32)])
+    r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+    accs = [_llvm.extractvalue(_raw(res4), r, [q]) for q in range(32)]
+    vt = ir.Type.parse("vector<4xi32>")
+    frags = [_llvm.extractvalue(vt, r, [32 + i]) for i in range(12)]
+    return accs, frags
+
+
+def _asm_quad_layout(tile_stride, with_read, acc_agpr=True, _c={}):
+    """One quad = 8 MFMAs (4 A-tiles x 2 B-tiles) on cur_frag -> acc8. with_read
+    prepends lgkmcnt(0) + 12 next-frag ds_reads (base+offset) and outputs frags_next
+    (FIRST quad of the iter). Splitting the 32-MFMA cluster into 4 quad asm blocks
+    lets a G2S load_one be issued between them (async copy overlaps later quads'
+    MFMAs) -> recovers the ~24% G2S cost the monolithic cluster exposed."""
+    key = (tile_stride, with_read, acc_agpr)
+    if key in _c:
+        return _c[key]
+    acc_c = "=a" if acc_agpr else "=v"
+    if with_read:
+        o_acc = list(range(8)); o_fn = list(range(8, 20)); n_out = 20
+        i_a0, i_a1, i_b0, i_b1 = n_out, n_out + 1, n_out + 2, n_out + 3
+        i_sa = i_b1 + 1; i_sb = i_sa + 8; i_cf = i_sb + 4
+        out_cons = [acc_c] * 8 + ["=&v"] * 12
+        in_cons = ["v"] * 4 + ["v"] * 8 + ["v"] * 4 + ["v"] * 12 + [str(q) for q in o_acc]
+        st = "!llvm.struct<(" + ", ".join(["vector<4xf32>"] * 8 + ["vector<4xi32>"] * 12) + ")>"
+        L = ["s_waitcnt lgkmcnt(0)"]
+        for i in range(4): L.append(f"ds_read_b128 ${o_fn[i]}, ${i_a0} offset:{i * tile_stride}")
+        for i in range(4): L.append(f"ds_read_b128 ${o_fn[4 + i]}, ${i_a1} offset:{i * tile_stride}")
+        for j in range(2): L.append(f"ds_read_b128 ${o_fn[8 + j]}, ${i_b0} offset:{j * tile_stride}")
+        for j in range(2): L.append(f"ds_read_b128 ${o_fn[10 + j]}, ${i_b1} offset:{j * tile_stride}")
+    else:
+        o_acc = list(range(8)); n_out = 8
+        i_sa = n_out; i_sb = i_sa + 8; i_cf = i_sb + 4
+        out_cons = [acc_c] * 8
+        in_cons = ["v"] * 8 + ["v"] * 4 + ["v"] * 12 + [str(q) for q in o_acc]
+        st = "!llvm.struct<(" + ", ".join(["vector<4xf32>"] * 8) + ")>"
+        L = []
+    cons = ",".join(out_cons + in_cons)
+    _c[key] = (L, cons, st, i_sa, i_sb, i_cf, o_acc)
+    return _c[key]
+
+
+def _asm_quad(quad, tile_stride, sa, sb, cur_frag, acc8, res4, bases=None, acc_agpr=True):
+    """Emit one quad (8 MFMA -> acc8). quad in 0..3 selects A-region (quad//2) and
+    B-region (quad%2). bases=(a0,a1,b0,b1) -> also issue 12 next ds_reads + return
+    frags_next."""
+    with_read = bases is not None
+    L0, cons, st, i_sa, i_sb, i_cf, o_acc = _asm_quad_layout(tile_stride, with_read, acc_agpr)
+    L = list(L0)
+    ar = (quad // 2) * 4
+    br = (quad % 2) * 2
+    for t in range(8):
+        ai = ar + t // 2
+        bj = br + t % 2
+        if _USE_NS_MFMA:
+            L.append(_ASM_CL_MFMA_NS.format(d=o_acc[t], a=i_cf + ai, b=i_cf + 8 + bj, c=o_acc[t]))
+        else:
+            L.append(_ASM_CL_MFMA.format(d=o_acc[t], a=i_cf + ai, b=i_cf + 8 + bj,
+                                         c=o_acc[t], sa=i_sa + ai, sb=i_sb + bj))
+    asm = "\n".join(L)
+    pre = [_raw(x) for x in bases] if with_read else []
+    ins = pre + [_raw(x) for x in sa] + [_raw(x) for x in sb] \
+        + [_raw(x) for x in cur_frag] + [_raw(acc8[q]) for q in range(8)]
+    r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+    accs = [_llvm.extractvalue(_raw(res4), r, [q]) for q in range(8)]
+    if with_read:
+        vt = ir.Type.parse("vector<4xi32>")
+        return accs, [_llvm.extractvalue(vt, r, [8 + i]) for i in range(12)]
+    return accs
 
 
 def il_mma(mfma, quads, prefetch, ua, n_ta, n_tb, per=8, first=False, pinned=False, sched_mm=0, sched_dsrd_n=0):
@@ -785,6 +1127,8 @@ def compile_mxfp4_gemm_8w(
     const_scale: bool = False,
     packed_scale: bool = True,
     combine_a: bool = True,
+    swizzle: bool = False,
+    nog2s: bool = False,
 ):
     # block_k: logical fp4 contracted per K-iter. The 16x16x128 MFMA always does
     # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
@@ -817,6 +1161,13 @@ def compile_mxfp4_gemm_8w(
     N_SUB = BLOCK_K // 128  # 128-K MFMA sub-blocks per K-iter
     BPR = BLOCK_K // 2  # packed-fp4 bytes per K-iter row in LDS
     KSTEP = BPR  # gmem byte stride per K-iter
+    # LDS bank-swizzle (kills the identity-layout ds_read bank conflict via direct-DMA
+    # lane<->gmem permutation; see _swz_fwd). Bulk-only: BK=128 (n_sub=1, 64B row),
+    # non-padded, BM256/BN256 (no narrow-A/B or combined-128-B G2S row remap).
+    if swizzle:
+        assert mode == "pipe" and not padded and BLOCK_M == 256 and BLOCK_N == 256, \
+            "swizzle requires mode=pipe, non-padded, BM256/BN256"
+        # n_sub-agnostic byte-offset swizzle (BK128 8-way + BK256 16-way bank conflict).
     # Wave topology: 2x4 = 2 M-waves x 4 N-waves (default); 4x2 = 4 M-waves x 2
     # N-waves. NW_N = #N-waves (the kernel-body divisor: wave_m=wave_id//NW_N,
     # wave_n=wave_id%NW_N). Region halving (c00/c01/c10/c11, LDS_BLOCK_*) is
@@ -937,8 +1288,8 @@ def compile_mxfp4_gemm_8w(
                 eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
                 gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
                 a_g2s_narrow = G2SLoader(a_div, gl_off_a_narrow, 1, F8_IR_t, eff_wave_a)
-        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
-        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad, swizzle=swizzle)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad, swizzle=swizzle)
         # A-scale num_records must cover the rows the kernel addresses =
         # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
         # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
@@ -1163,6 +1514,29 @@ def compile_mxfp4_gemm_8w(
         B_s2_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
         B_s2_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
+    @fx.struct
+    class SharedStorageFp4Pipe5:   # deeper G2S prefetch (up to 5 K-blocks resident)
+        A_s0_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s0_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s1_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s1_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s2_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s2_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s3_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s3_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s4_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_s4_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        B_s0_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s0_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s1_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s1_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s2_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s2_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s3_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s3_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s4_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_s4_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm_pipea(
         A: fx.Tensor,
@@ -1289,6 +1663,159 @@ def compile_mxfp4_gemm_8w(
         store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
         store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
+    @flyc.kernel(name="asmil", known_block_size=[512, 1, 1])
+    def kernel_gemm_asmil(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+    ):
+        # Whole-iter bare-asm cluster, TRIPLE-buffered (bulk BN256 only). asm gives 32
+        # back-to-back MFMAs (denser than pipe's per-8-cluster gaps) + the cross-iter
+        # ds_read pipeline (asm_cluster32_pipe). Triple-buffer (3 stages) lets the G2S
+        # for block k+3 overlap iter k+1's MFMAs (the G2S target is read 2 iters out,
+        # so a graded vmcnt keeps it in flight) -- the 2-buffer version had to fully
+        # drain G2S each iter (exposed). SCALE-FREE POC (immediate scale).
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+        NSTAGE = int(os.environ.get("FP4_NSTAGE", "3"))  # 3 best (deeper no help)   # G2S prefetch depth (3..5)
+        lds = fx.SharedAllocator().allocate(SharedStorageFp4Pipe5).peek()
+        _ALLST = [(lds.A_s0_0, lds.A_s0_1, lds.B_s0_0, lds.B_s0_1),
+                  (lds.A_s1_0, lds.A_s1_1, lds.B_s1_0, lds.B_s1_1),
+                  (lds.A_s2_0, lds.A_s2_1, lds.B_s2_0, lds.B_s2_1),
+                  (lds.A_s3_0, lds.A_s3_1, lds.B_s3_0, lds.B_s3_1),
+                  (lds.A_s4_0, lds.A_s4_1, lds.B_s4_0, lds.B_s4_1)]
+        ST = _ALLST[:NSTAGE]
+
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        wave_m = wave_id // 4
+        wave_n = wave_id % 4
+        block_m, block_n = grouped_xcd_pid(fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N,
+                                           group_m=group_m, num_xcds=num_xcds, group_n=group_n)
+        A0_off = block_m * BLOCK_M * K2
+        A1_off = (block_m * BLOCK_M + LDS_BLOCK_M) * K2
+        B0_off = block_n * BLOCK_N * K2
+        B1_off = (block_n * BLOCK_N + LDS_BLOCK_N) * K2
+
+        gA = make_fp8_buffer_tensor(A, F8_IR_t)
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B)
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=False)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=False)
+        store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+
+        wave_m_offset = wave_m * (N_TILES_A * 16)
+        wave_n_offset = wave_n * (N_TILES_B * 16)
+
+        res4 = Vec.make_type(4, fx.Float32)
+        zero = Vec.filled(4, 0.0, fx.Float32)
+        sc = fx.Int32(0x7F7F7F7F)              # scale-free immediate E8M0 (replicated)
+        sc8 = [sc] * 8
+        sc4 = [sc] * 4
+        acc = [zero] * 32
+        G2S_N = 2 * (N_LDS_STEPS_A + N_LDS_STEPS_B)   # buffer_loads per K-block
+
+        def g2s_block(stage, blk):
+            a0, a1, b0, b1 = stage
+            b_g2s.load(b0, B0_off + blk * KSTEP); a_g2s.load(a0, A0_off + blk * KSTEP)
+            b_g2s.load(b1, B1_off + blk * KSTEP); a_g2s.load(a1, A1_off + blk * KSTEP)
+
+        # --- inline-asm G2S (buffer_load_lds in asm text) so it can be co-issued with
+        # the MFMA cluster. Validate addressing in-gap first (FP4_G2SASM=1).
+        _g2sasm = os.environ.get("FP4_G2SASM", "0") == "1"
+        rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * fx.Int32(K2))
+        rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * fx.Int32(K2))
+
+        def _m0(arr):
+            return rocdl.readfirstlane(T.i32, fx.Int32(fx.ptrtoint(arr.ptr)) + wave_id * fx.Int32(1024))
+
+        def _g2s1(rsrc, arr, gloff, region_off, blk):
+            voff = gloff[0] + region_off + fx.Int32(blk * KSTEP)
+            _llvm.inline_asm(ir.Type.parse("!llvm.void"),
+                             [_raw(_m0(arr)), _raw(voff), _raw(rsrc)],
+                             "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, 0 offen lds",
+                             "s,v,s", has_side_effects=True)
+
+        def g2s_block_asm(stage, blk):
+            a0, a1, b0, b1 = stage
+            _g2s1(rsrc_b, b0, gl_off_b, B0_off, blk); _g2s1(rsrc_a, a0, gl_off_a, A0_off, blk)
+            _g2s1(rsrc_b, b1, gl_off_b, B1_off, blk); _g2s1(rsrc_a, a1, gl_off_a, A1_off, blk)
+
+        TS = a_s2r.tile_stride                # per-tile LDS byte step (16*row_stride)
+
+        def st_base(stage):
+            a0, a1, b0, b1 = stage
+            return a_s2r.base_addr(a0), a_s2r.base_addr(a1), b_s2r.base_addr(b0), b_s2r.base_addr(b1)
+
+        # prologue: fill all NSTAGE stages (blocks 0..NSTAGE-1), drain, barrier
+        for j in range_constexpr(NSTAGE):
+            if const_expr(j < KI):
+                g2s_block(ST[j], j)
+        wait_vmcnt(0)
+        rocdl.s_barrier()
+
+        # prime: read block0 frags from stage 0
+        pa0, pa1, pb0, pb1 = st_base(ST[0])
+        frags = asm_read12(pa0, pa1, pb0, pb1, TS)
+
+        # deeper prefetch: G2S block k+NSTAGE -> stage k%NSTAGE; that block is read at
+        # iter k+NSTAGE-1, so it gets NSTAGE-1 iters of MFMA to transfer. Keep NSTAGE-2
+        # blocks in flight (vmcnt), draining the one read next iter. NSTAGE=3 == prior.
+        KEEP = (NSTAGE - 2) * G2S_N
+
+        def g2s_voff_m0(stage, blk):
+            a0, a1, b0, b1 = stage
+            voffs = [gl_off_b[0] + B0_off + fx.Int32(blk * KSTEP),
+                     gl_off_a[0] + A0_off + fx.Int32(blk * KSTEP),
+                     gl_off_b[0] + B1_off + fx.Int32(blk * KSTEP),
+                     gl_off_a[0] + A1_off + fx.Int32(blk * KSTEP)]
+            m0s = [_m0(b0), _m0(a0), _m0(b1), _m0(a1)]
+            return voffs, m0s
+
+        for k in range_constexpr(KI):
+            nxt = ST[(k + 1) % NSTAGE]            # block k+1 (visible)
+            na0, na1, nb0, nb1 = st_base(nxt)
+            if const_expr(_g2sasm and k + NSTAGE < KI):
+                # G2S block k+NSTAGE buffer_loads interleaved IN the MFMA asm (co-issue)
+                voffs, m0s = g2s_voff_m0(ST[k % NSTAGE], k + NSTAGE)
+                acc, frags = asm_cluster32_pipe_g2s(na0, na1, nb0, nb1, TS, sc8, sc4, frags, acc,
+                                                    res4, rsrc_a, rsrc_b, voffs, m0s)
+                wait_vmcnt(KEEP)
+                # cross-wave WAR: the next iter's early buffer_load overwrites the stage
+                # THIS iter read (frags_next). Drain all waves' frags_next reads before
+                # the barrier so the barrier guarantees the stage is fully read.
+                wait_lgkm()
+            else:
+                # read block k+1, MFMA block k; (tail or non-g2sasm) G2S in the gap
+                acc, frags = asm_cluster32_pipe(na0, na1, nb0, nb1, TS, sc8, sc4, frags, acc, res4)
+                if const_expr(k + NSTAGE < KI):
+                    g2s_block(ST[k % NSTAGE], k + NSTAGE)
+                    wait_vmcnt(KEEP)
+                else:
+                    wait_vmcnt(0)            # tail: fully drain remaining in-flight
+            rocdl.s_barrier()
+
+        c00 = [Vec(acc[q]) for q in range_constexpr(8)]
+        c01 = [Vec(acc[8 + q]) for q in range_constexpr(8)]
+        c10 = [Vec(acc[16 + q]) for q in range_constexpr(8)]
+        c11 = [Vec(acc[24 + q]) for q in range_constexpr(8)]
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+        store_c.store(c00, base_row + 0, base_col + 0)
+        store_c.store(c01, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+
     @flyc.kernel(known_block_size=[512, 1, 1])
     def kernel_gemm_pipe(
         A: fx.Tensor,
@@ -1345,13 +1872,21 @@ def compile_mxfp4_gemm_8w(
             a_g2s = PaddedG2SLoader(A, c_m, K, lane_id, wave_id, N_LDS_STEPS_A, BPR, LDS_ROW_STRIDE)
             b_g2s = PaddedG2SLoader(B_T, c_n, K, lane_id, wave_id, N_LDS_STEPS_B, BPR, LDS_ROW_STRIDE)
         else:
-            gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR)
-            gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR)
+            gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
+            gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR, swizzle=swizzle)
             gl_off_b_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B_FULL, BPR)
             a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
             b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
             # BN128: combined-128 B G2S (one 128-row G2S fills adjacent b0+b1 halves).
             b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
+            # PERF DIAGNOSTIC (nog2s): no-op the G2S buffer_loads to measure the
+            # MFMA+S2R+barrier ceiling with G2S "free" (output garbage). wait_barrier
+            # (vmcnt) passes trivially with 0 outstanding; s_barrier WG-sync stays.
+            if const_expr(nog2s):
+                _noop = lambda *a, **k: None
+                a_g2s.load = _noop
+                b_g2s.load = _noop
+                b_g2s_full.load = _noop
             # B6 BM192 (r6_3): clamp-wave narrow-A G2S. LDS_BLOCK_M=96 < 128 step ->
             # N_LDS_STEPS_A==0 (regular a_g2s loads nothing). Mirror staged (r6_2):
             # each 96-row A region filled by one combined G2S step where the wave
@@ -1364,8 +1899,8 @@ def compile_mxfp4_gemm_8w(
                 eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
                 gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
                 a_g2s_narrow = G2SLoader(a_div, gl_off_a_narrow, 1, F8_IR_t, eff_wave_a)
-        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
-        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad)
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad, swizzle=swizzle)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=(not asm_mfma) and frag_pad, swizzle=swizzle)
         # A-scale num_records must cover the rows the kernel addresses =
         # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
         # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
@@ -1415,13 +1950,19 @@ def compile_mxfp4_gemm_8w(
             if const_expr(const_scale):
                 return [[0x7F7F7F7F] * SA_TILES for s in range_constexpr(N_SUB)]
             if const_expr(combine_a):
-                # reg0 issues ONE coalesced dwordx2 (both M-regions) + caches by kiter;
-                # reg1 reads the cache (reg0 always precedes reg1 for a given kiter).
-                if const_expr(reg == 0):
-                    if const_expr(kiter not in _sa_a2_cache):
-                        _sa_a2_cache[kiter] = sa_s2r.load(base, kiter)
-                    return [_sa_a2_cache[kiter][0]]
-                return [_sa_a2_cache[kiter][1]]
+                # Per K-128 sub-block (N_SUB of them per K-iter): reg0 issues ONE
+                # coalesced dwordx2 (both M-regions) + caches by k128 index; reg1 reads
+                # the cache (reg0 always precedes reg1 for a given k128).
+                out = []
+                for s in range_constexpr(N_SUB):
+                    k128 = N_SUB * kiter + s
+                    if const_expr(reg == 0):
+                        if const_expr(k128 not in _sa_a2_cache):
+                            _sa_a2_cache[k128] = sa_s2r.load(base, k128)
+                        out.append(_sa_a2_cache[k128][0])
+                    else:
+                        out.append(_sa_a2_cache[k128][1])
+                return out
             # packed: each sub-block returns ONE packed i32 (n_tiles E8M0 in 4 bytes).
             return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
 
@@ -2470,7 +3011,7 @@ def compile_mxfp4_gemm_8w(
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N) * split_k
         kern = {"staged": kernel_gemm_staged, "pipe": kernel_gemm_pipe, "pipeh": kernel_gemm_pipeh,
                 "pipe3": kernel_gemm_pipe3, "pipea": kernel_gemm_pipea,
-                "pipeb": kernel_gemm_pipeb,
+                "pipeb": kernel_gemm_pipeb, "asmil": kernel_gemm_asmil,
                 "il": kernel_gemm_il, "rt": kernel_gemm_rt, "rt2": kernel_gemm_rt2}.get(mode, kernel_gemm)
         kern(
             A, B_T, C, A_scale, B_scale, c_m, c_n,
