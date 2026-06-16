@@ -1906,6 +1906,12 @@ class MfmaScaleFp4:
                     if _2a:  # phase A: Q=2*par+0. refill reads buf[(Q+1)%4] (for next phase); g2s writes buf[(Q+2)%4]
                         _scrdbuf[0] = (2 * _par + 1) % 4
                         _g2sA = emit_g2s(0, o_sa, o_sbl, o_sbr) + emit_scale_g2s((2 * _par + 2) % 4, 0)
+                    # FP4_SCV_ILV: interleave the SCVGPR scale buffer_load INTO the mfma stream
+                    # (prepend to g2sl) instead of bursting it at the phase boundary, so it overlaps
+                    # mfma + stops competing with g2s for the boundary vmem slot (closes the ~100TF
+                    # scale-load gap to the const-scale ceiling). _scv_adv (o_sca SGPR advance) MUST
+                    # move AFTER emit_inplace so the interleaved loads read the un-advanced offset.
+                    _scvilv = _SCVGPR and not _SCV2AHEAD and int(__import__("os").environ.get("FP4_SCV_ILV", "0"))
                     # phase A
                     if _SCVGPR:
                         if _SCV2AHEAD:
@@ -1915,7 +1921,10 @@ class MfmaScaleFp4:
                             _scb[0] = 0
                             _nop = int(__import__("os").environ.get("FP4_SCV_NOP","0"))
                             if _nop: L.append(f"s_nop {_nop}")
-                            L += emit_sc_vgpr(nsct) + _scv_adv()                   # 1-ahead: load set B
+                            if _scvilv:
+                                _g2sA = emit_sc_vgpr(nsct) + _g2sA                 # 1-ahead: load set B, interleaved
+                            else:
+                                L += emit_sc_vgpr(nsct) + _scv_adv()               # 1-ahead: load set B (burst)
                     if _SCDWX4 and _grup and not _direct:
                         L += emit_scale_g2s(0, 0)   # GR upfront (whole block before mfma, not interleaved)
                         if int(__import__("os").environ.get("FP4_SCDWX4_BAR2","0")): L.append("s_waitcnt vmcnt(0)" + ("" if int(__import__("os").environ.get("FP4_SCDWX4_DRONLY","0")) else "\ns_barrier"))
@@ -1923,6 +1932,8 @@ class MfmaScaleFp4:
                         L += emit_nsubfold(0, 1, _g2sA)
                     else:
                         L += emit_inplace(1, _g2sA, side=_sA)
+                    if _scvilv:
+                        L += _scv_adv()   # advance o_sca AFTER the interleaved set-B loads read it
                     if _TRB8 and not _ipnog and not _noscg:
                         L += emit_scale_g2s(0, 0)   # contiguous scale g2s block for buffer 0
                     L.append(_ipenda)
@@ -1955,7 +1966,10 @@ class MfmaScaleFp4:
                             _scb[0] = nsct
                             _nop = int(__import__("os").environ.get("FP4_SCV_NOP","0"))
                             if _nop: L.append(f"s_nop {_nop}")
-                            L += emit_sc_vgpr(0) + _scv_adv()                      # 1-ahead: load set A
+                            if _scvilv:
+                                _g2sB = emit_sc_vgpr(0) + _g2sB                    # 1-ahead: load set A, interleaved
+                            else:
+                                L += emit_sc_vgpr(0) + _scv_adv()                  # 1-ahead: load set A (burst)
                     if _SCDWX4 and _grup and not _direct:
                         L += emit_scale_g2s(1, 0)   # GR upfront
                         if int(__import__("os").environ.get("FP4_SCDWX4_BAR2","0")): L.append("s_waitcnt vmcnt(0)" + ("" if int(__import__("os").environ.get("FP4_SCDWX4_DRONLY","0")) else "\ns_barrier"))
@@ -1963,6 +1977,8 @@ class MfmaScaleFp4:
                         L += emit_nsubfold(1, 0, _g2sB)
                     else:
                         L += emit_inplace(0, _g2sB, side=_sB)
+                    if _scvilv:
+                        L += _scv_adv()   # advance o_sca AFTER the interleaved set-A loads read it
                     if _TRB8 and not _ipnog and not _noscg:
                         L += emit_scale_g2s(1, 0)   # contiguous scale g2s block for buffer 1
                     L.append(_ipend)
