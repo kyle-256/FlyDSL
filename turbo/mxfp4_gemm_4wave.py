@@ -52,6 +52,8 @@ _PROD_DEFAULTS = {
     "FP4_INPLACE_ALT": "0",     # B-side progressive (complements MMORD=5)
     "FP4_INPLACE_GAVOID": "1",  # avoid g2s in refill-free slots -> better LDS bandwidth
     "FP4_WLBARNOP": "1",       # 1 s_nop after barrier: settle time for barrier -> smoother ds_read start
+    "FP4_WLDSR": "1",          # enable finer ds_read stagger (emit_phase_dsr style)
+    "FP4_DSRD": "4",           # read-ahead depth for WLDSR (D=4: stagger reads 4 mfma ahead of first-use)
     "FP4_SC_VGPR": "1", "FP4_PIN": "1", "FP4_PINSC": "1", "FP4_PINBASE": "8",
     "FP4_SCV_ILV": "1",   # interleave scale buffer_load into mfma stream (overlaps mfma, frees boundary vmem slot)
 }

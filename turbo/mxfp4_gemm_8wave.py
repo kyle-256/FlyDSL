@@ -1370,6 +1370,11 @@ class MfmaScaleFp4:
                 else:
                     mid = set(t for t in last if t_bl <= t < t_sc)
                 _ipnodsr = int(__import__("os").environ.get("FP4_WLNODSR", "0"))  # ceiling probe: skip refills
+                # FP4_PREFETCH: issue each refill at fraction of its last-use position (early prefetch).
+                # FP4_PREFETCH=0 -> default (at last-use). FP4_PREFETCH=1 -> at (last_use * FRAC).
+                # FRAC = FP4_PREFETCH_DEPTH / 100 (0..100). det0 if nxt_buf data is ready by read time.
+                _prefetch = int(__import__("os").environ.get("FP4_PREFETCH", "0"))
+                _pf_depth = int(__import__("os").environ.get("FP4_PREFETCH_DEPTH", "50"))  # % of last_use
                 # aiter-style pacing (replicate aiter .s: 17 s_nop + 16 fine lgkmcnt vs fly 0 + 1
                 # coarse lgkmcnt(0)/phase). Both gates only ADD s_nop / s_waitcnt; never reorder mfma
                 # or drop/move a ds_read. FP4_FINELGK=0 FP4_MFMANOP=0 reproduces current bytes exactly.
@@ -1379,6 +1384,13 @@ class MfmaScaleFp4:
                 if int(__import__("os").environ.get("FP4_WLNOG2S", "0")):  # ceiling probe: skip g2s
                     g2sl = []
                 out = []; gi = 0; refilled = set()
+                # FP4_PREFETCH: schedule refill at (last_use * frac) instead of last_use.
+                _pf_sched = {}
+                if _prefetch and not _ipnodsr:
+                    for rt, lu in last.items():
+                        if rt in mid:
+                            issue_at = max(0, int(lu * _pf_depth / 100))
+                            _pf_sched.setdefault(issue_at, []).append(rt)
                 # FP4_WLRING_GFRAC: aiter g2s front-load (g2s in first gfrac of mfma, tail clear->lands)
                 _gfr_ip = float(__import__("os").environ.get("FP4_WLRING_GFRAC", "0"))
                 # FP4_INPLACE_GLATE: g2s in LAST glate-fraction of mfma (DIAG refills are early/progressive
@@ -1451,6 +1463,11 @@ class MfmaScaleFp4:
                     _emit = 0; _lastlgk = None; _nopc = 0
                     for mi, (ml, at, bt, sat, sbt) in enumerate(mlist):
                         out.append(ml)
+                        # FP4_PREFETCH: issue early refill reads at fraction of last_use position
+                        if _prefetch and mi in _pf_sched and not _ipnodsr:
+                            for rt in _pf_sched[mi]:
+                                if rt not in refilled:
+                                    out.append(ds_line(nxt_buf, rt)); refilled.add(rt); _emit += 1
                         if _mfmanop:
                             _nopc += 1
                             if _nopc >= _nopgap:
@@ -1625,16 +1642,28 @@ class MfmaScaleFp4:
             for g in range(4):
                 L.append(f"s_mov_b32 ${o_sca[g]}, ${i_sca0[g]}")
             # SCVGPR scale prefetch: emit_sc_vgpr(tb) loads this kk's 8 scale dwords lane-contig
-            # DIRECT to t_sc[tb:tb+8] via 2 buffer_load_dwordx4 (A->[tb:tb+4], B->[tb+4:tb+8]).
+            # DIRECT to t_sc[tb:tb+8] via 2 buffer_load_{width} (A->[tb:tb+_scw-1], B->[tb+_scw:..]).
             # NO vmcnt here (in flight; drained by the phase-end vmcnt) -> overlaps mfma, scale free.
             # ping-pong sets (tb=0 / tb=nsct) so mfma reads the set loaded last phase. needs PIN+PINSC.
-            _pbsc = _TRB8BASE
+            # PIN path: scale literals must align to PIN-allocated scale VGPR base (PINBASE + 4*ntmp),
+            # NOT just PINBASE (operand frags come first). Without alignment SCVGPR writes different VGPRs
+            # than mfma reads -> SNR 21 bug (n_sub=1 exposed it; n_sub=2 mask by PINBASE coincidence).
+            _pin_active = int(__import__("os").environ.get("FP4_PIN", "0"))
+            _pinsc_active = int(__import__("os").environ.get("FP4_PINSC", "0"))
+            _pinbase = int(__import__("os").environ.get("FP4_PINBASE", "8"))
+            # PINSC=1: scale VGPRs at PINBASE (scale first, then frags) -> _pbsc = PINBASE = _TRB8BASE.
+            # PINSC=0 / PIN off: same (legacy PINBASE addressing).
+            _pbsc = _TRB8BASE  # = PINBASE; correct for both PIN/PINSC=1 (scale first) and PIN off
             _scv_dwx4 = int(__import__("os").environ.get("FP4_SCV_DWX4", "1"))  # 1=dwordx4 literal; 0=4 tracked dword
+            _scw = 2 * n_sub   # scale dwords per operand (A or B): 2 groups x n_sub subs
+            _scwx = {1: "", 2: "x2", 4: "x4"}.get(_scw, f"x{_scw}")   # buffer_load width suffix
             def emit_sc_vgpr(tb):
                 p = _pbsc + tb
                 if _scv_dwx4:
-                    return [f"buffer_load_dwordx4 v[{p}:{p+3}], ${i_scvoff}, ${i_scrsa}, ${o_sca[0]} offen",
-                            f"buffer_load_dwordx4 v[{p+4}:{p+7}], ${i_scvoff}, ${i_scrsb}, ${o_sca[2]} offen"]
+                    # A -> v[p:p+_scw-1], B -> v[p+_scw:p+2*_scw-1] (width = 2*n_sub; was hardcoded
+                    # dwordx4 for n_sub=2; n_sub=1 needs dwordx2 -> fixes BK128 SCVGPR).
+                    return [f"buffer_load_dword{_scwx} v[{p}:{p+_scw-1}], ${i_scvoff}, ${i_scrsa}, ${o_sca[0]} offen",
+                            f"buffer_load_dword{_scwx} v[{p+_scw}:{p+2*_scw-1}], ${i_scvoff}, ${i_scrsb}, ${o_sca[2]} offen"]
                 # tracked dword: write ${t_sc+...} operands (LLVM sees def -> no literal-reg race)
                 r = [f"buffer_load_dword ${t_sc+tb+i}, ${i_scvoff}, ${i_scrsa}, ${o_sca[0]} offen offset:{i*4}" for i in range(4)]
                 r += [f"buffer_load_dword ${t_sc+tb+4+i}, ${i_scvoff}, ${i_scrsb}, ${o_sca[2]} offen offset:{i*4}" for i in range(4)]
@@ -1963,7 +1992,7 @@ class MfmaScaleFp4:
                             _scb[0] = 2 * nsct + _par * nsct                       # read B[par]
                             L += emit_sc_vgpr(2 * nsct + (1 - _par) * nsct) + _scv_adv()  # load B[1-par]
                         else:
-                            _scb[0] = nsct
+                            _scb[0] = nsct   # set B base offset (ping-pong; = 2*_scw)
                             _nop = int(__import__("os").environ.get("FP4_SCV_NOP","0"))
                             if _nop: L.append(f"s_nop {_nop}")
                             if _scvilv:
