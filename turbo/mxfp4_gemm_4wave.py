@@ -47,7 +47,8 @@ from turbo.mxfp4_gemm_8wave import (
 # Applied via setdefault so any explicit env var still overrides (experiments). FP4_PROD=0 disables.
 _PROD_DEFAULTS = {
     "FP4_ASMMFMA": "6", "FP4_INPLACE": "1", "FP4_INPLACE_DIAG": "1", "FP4_MMORD": "3",
-    "FP4_SINNER": "1", "FP4_INPLACE_1BAR": "0", "FP4_INPLACE_ELGK": "7", "FP4_WLVMCN": "8",
+    "FP4_SINNER": "1", "FP4_INPLACE_1BAR": "0", "FP4_INPLACE_ELGK": "13", "FP4_WLVMCN": "8",
+    "FP4_MMORD": "5",   # 2x4 wider N-block order: better B-operand reuse -> +60 TF med
     "FP4_SC_VGPR": "1", "FP4_PIN": "1", "FP4_PINSC": "1", "FP4_PINBASE": "8",
     "FP4_SCV_ILV": "1",   # interleave scale buffer_load into mfma stream (overlaps mfma, frees boundary vmem slot)
 }
@@ -414,7 +415,7 @@ def compile_mxfp4_gemm_4w(
                 _soa = rocdl.readfirstlane(T.i32, _wia * fx.Int32(K128) * fx.Int32(512))
                 _sob = rocdl.readfirstlane(T.i32, _wib * fx.Int32(K128) * fx.Int32(512))
                 sc_soff06 = [_soa, sc_soff06[1], _sob, sc_soff06[3]]
-                sc_voff6 = lane_id * fx.Int32(16)
+                sc_voff6 = lane_id * fx.Int32(8 * N_SUB)   # 2*N_SUB dwords/lane * 4B (was hardcoded 16 for N_SUB=2)
             accL, accR = mfma.call_mxfp4_wholeloop(
                 a_base6, bl_base6, br_base6, a_s2r.tile_stride, b_s2r.tile_stride,
                 abase6, blbase6, brbase6, gl_a6, gl_b6, rsrc_a, rsrc_b,
