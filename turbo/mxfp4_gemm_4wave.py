@@ -47,8 +47,9 @@ from turbo.mxfp4_gemm_8wave import (
 # Applied via setdefault so any explicit env var still overrides (experiments). FP4_PROD=0 disables.
 _PROD_DEFAULTS = {
     "FP4_ASMMFMA": "6", "FP4_INPLACE": "1", "FP4_INPLACE_DIAG": "1", "FP4_MMORD": "3",
-    "FP4_SINNER": "1", "FP4_INPLACE_1BAR": "0", "FP4_INPLACE_ELGK": "13", "FP4_WLVMCN": "8",
-    "FP4_MMORD": "5",   # 2x4 wider N-block order: better B-operand reuse -> +60 TF med
+    "FP4_SINNER": "1", "FP4_INPLACE_1BAR": "0", "FP4_INPLACE_ELGK": "9", "FP4_WLVMCN": "10",
+    "FP4_MMORD": "5",       # 2x4 wider N-block order: better B-operand reuse
+    "FP4_INPLACE_ALT": "0", # B-side progressive (complements MMORD=5)
     "FP4_SC_VGPR": "1", "FP4_PIN": "1", "FP4_PINSC": "1", "FP4_PINBASE": "8",
     "FP4_SCV_ILV": "1",   # interleave scale buffer_load into mfma stream (overlaps mfma, frees boundary vmem slot)
 }
