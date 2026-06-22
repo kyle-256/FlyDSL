@@ -22,9 +22,10 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly as fly_dialect
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import arith, const_expr, range_constexpr
+from flydsl.expr import arith, buffer_ops, const_expr, range_constexpr
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Vector as Vec
+from flydsl.expr.utils.arith import ArithValue
 from kernels.fp8_gemm_utils import (
     G2SLoader,
     S2RLoader,
@@ -90,6 +91,95 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
+class FusedQuantG2SLoader:
+    """Like G2SLoader but reads a BF16 global tensor, casts to FP8 in-register
+    (x * inv_scale -> e4m3), and writes FP8 to LDS. Eliminates the separate
+    dynamic-quant cast pass; the cast VALU overlaps the MFMA chain. ``inv_scale``
+    is a runtime scalar (1 / tensorwise-quant-scale). Reads use the SAME swizzled
+    global offsets and LDS destinations as G2SLoader, so S2R is unchanged."""
+
+    def __init__(self, gl_rsrc, gl_offsets, n_load_steps, lds_dtype, wave_id, inv_scale):
+        self.gl_rsrc = gl_rsrc  # bf16 buffer resource
+        self.gl_offsets = gl_offsets
+        self.n_load_steps = n_load_steps
+        self.wave_id = wave_id
+        self.inv_scale = inv_scale
+        self.n_waves = fx.block_dim.x // 64
+        self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
+
+    def _load_cast_store(self, lds_dst, k_offset, step):
+        off = self.gl_offsets[step] + k_offset  # element offset (bf16 == fp8 count)
+        parts = []
+        for j in range_constexpr(4):
+            v = buffer_ops.buffer_load(
+                self.gl_rsrc, fx.Int32(off + j * 4), vec_width=4, dtype=fx.BFloat16.ir_type
+            )
+            parts.append(Vec(v))
+        v01 = parts[0].shuffle(parts[1], list(range(8)))
+        v23 = parts[2].shuffle(parts[3], list(range(8)))
+        v16 = v01.shuffle(v23, list(range(16)))  # 16 bf16
+        f = v16.to(fx.Float32) * self.inv_scale  # Vec 16 f32
+        # f32 -> e4m3 via hardware cvt_pk_fp8_f32 (2 f32 -> 2 fp8 per call) -> 4 i32 words,
+        # written to LDS at base + lane*16 (matches buffer_load_lds dwordx4 lane layout).
+        i32t = fx.Int32.ir_type
+        c0 = fx.Int32(0)
+        lane_id = fx.thread_idx.x % 64
+        step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
+        base = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + fx.Int32(step_off) + lane_id * fx.Int32(16)
+        I32Ptr_t = fx.PointerType.get(fx.Int32.ir_type, 2, 512)
+        ws = []
+        for w in range_constexpr(4):
+            pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 0], f[4 * w + 1], c0, 0)
+            pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 2], f[4 * w + 3], pw, 1)
+            ws.append(Vec.filled(1, fx.Int32(pw), fx.Int32))
+        v4 = ws[0].shuffle(ws[1], [0, 1]).shuffle(ws[2].shuffle(ws[3], [0, 1]), [0, 1, 2, 3])
+        view = fx.make_view(fx.inttoptr(I32Ptr_t, base), fx.make_layout(4, 1))
+        fx.memref_store_vec(v4, view)
+
+    def load(self, lds_dst, k_offset):
+        for step in range_constexpr(self.n_load_steps):
+            self._load_cast_store(lds_dst, k_offset, step)
+
+    def load_one(self, lds_dst, k_offset, step):
+        self._load_cast_store(lds_dst, k_offset, step)
+
+
+class StoreCScalar:
+    """Tensorwise (scalar) output dequant store: out = (acc * scale).to(bf16),
+    scale = a_scale * b_scale (both scalar)."""
+
+    def __init__(self, scale, C, c_rows, c_cols, c_idx_fn, n_tiles_a, n_tiles_b):
+        self.c_rows = c_rows
+        self.c_cols = c_cols
+        self.lane_id = fx.thread_idx.x % 64
+        self.c_idx_fn = c_idx_fn
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+        self.scale = scale
+        c_nbytes = c_rows * c_cols * 2
+        gC = fx.rocdl.make_buffer_tensor(C, max_size=False, num_records_bytes=c_nbytes)
+        self.c_div = fx.logical_divide(gC, fx.make_layout(1, 1))
+        self.out_atom_1 = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), fx.BFloat16)
+        self.reg_bf16_1 = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.BFloat16)
+
+    def _store_bf16(self, value_bf16, c_index):
+        fx.memref_store_vec(Vec.filled(1, value_bf16, fx.BFloat16), self.reg_bf16_1)
+        fx.copy(self.out_atom_1, self.reg_bf16_1, fx.slice(self.c_div, (None, fx.Int32(c_index))))
+
+    def store(self, c_frag, base_row, base_col):
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            for tj in range_constexpr(self.n_tiles_b):
+                col = base_col + tj * 16 + self.lane_id % 16
+                col_valid = col < self.c_cols
+                oob = fx.Int32(self.c_rows * self.c_cols)
+                vec_f32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for i in range_constexpr(4):
+                    scaled = (vec_f32[i] * self.scale).to(fx.BFloat16)
+                    c_index = (row + i) * self.c_cols + col
+                    self._store_bf16(scaled, arith.select(col_valid, c_index, oob))
+
+
 def _min(a, b):
     return arith.select(a < b, a, b)
 
@@ -131,6 +221,7 @@ def compile_fp8_gemm_4w(
     waves_per_eu: int = 1,
     agpr_alloc: int = 0,  # 0=auto (asm modes force 16*N_ACCUMS AGPRs, required for correctness); N>0 force "N,N"; -N allow "0,N"
     asm_mma: int = 2,  # 2=AGPR in-place inline-asm MFMA (kills accvgpr shuffle, default); 0=atom; 3=VGPR in-place
+    fuse_q: bool = False,  # True: A/B are BF16; tensorwise-quant cast (x*inv_scale->e4m3 via cvt_pk_fp8_f32) fused into G2S; A_scale/B_scale are scalar quant scales. CORRECT (SNR 55) but ~1.5-2x SLOWER than separate quant+gemm: inline cvt VALU doesn't overlap MFMA, so the dedicated peak-BW quant kernel wins. Kept as reference; fusion is net-negative here.
 ):
     # MFMA atom is 16x16x128; 4 waves in a 2x2 config require BLOCK >= 64.
     BLOCK_K = 128
@@ -203,10 +294,22 @@ def compile_fp8_gemm_4w(
         B1_gl_offset = (tile_j * BLOCK_N + LDS_BLOCK_N) * K
         B_K_STEP = (2 * 1024) if b_preshuffled else BLOCK_K
 
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
-        ga_div = fx.logical_divide(gA, fx.make_layout(1, 1))
-        gb_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+        if const_expr(fuse_q):
+            # BF16 inputs; fused quant cast in G2S. Read scalar tensorwise scales.
+            a_rsrc = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K * 2)
+            b_rsrc = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * K * 2)
+            sa_rsrc = buffer_ops.create_buffer_resource(A_scale, max_size=False, num_records_bytes=4)
+            sb_rsrc = buffer_ops.create_buffer_resource(B_scale, max_size=False, num_records_bytes=4)
+            a_scale_v = ArithValue(buffer_ops.buffer_load(sa_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Float32.ir_type))
+            b_scale_v = ArithValue(buffer_ops.buffer_load(sb_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Float32.ir_type))
+            inv_a = 1.0 / a_scale_v
+            inv_b = 1.0 / b_scale_v
+            out_scale = a_scale_v * b_scale_v
+        else:
+            gA = make_fp8_buffer_tensor(A, F8_IR_t)
+            gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+            ga_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+            gb_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
         def _compute_lds_swizzle(s2r, preshuffled=False):
             lds_swz = []
@@ -351,11 +454,18 @@ def compile_fp8_gemm_4w(
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
         gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=b_preshuffled)
 
-        a_g2s = G2SLoader(ga_div, gl_off_a, N_TILES_A, F8_IR_t, wave_id)
-        b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
+        if const_expr(fuse_q):
+            a_g2s = FusedQuantG2SLoader(a_rsrc, gl_off_a, N_TILES_A, F8_IR_t, wave_id, inv_a)
+            b_g2s = FusedQuantG2SLoader(b_rsrc, gl_off_b, N_TILES_B, F8_IR_t, wave_id, inv_b)
+        else:
+            a_g2s = G2SLoader(ga_div, gl_off_a, N_TILES_A, F8_IR_t, wave_id)
+            b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_i, N_TILES_A)
         b_s2r = S2RLoader(wave_j, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        if const_expr(fuse_q):
+            store_c = StoreCScalar(out_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        else:
+            store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         # Prologue: 8-buffer LDS pipeline pre-fill.
         a_g2s.load(a_cur0, A0_gl_offset + 0 * A_K_STEP)
