@@ -91,59 +91,6 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
-class FusedQuantG2SLoader:
-    """Like G2SLoader but reads a BF16 global tensor, casts to FP8 in-register
-    (x * inv_scale -> e4m3), and writes FP8 to LDS. Eliminates the separate
-    dynamic-quant cast pass; the cast VALU overlaps the MFMA chain. ``inv_scale``
-    is a runtime scalar (1 / tensorwise-quant-scale). Reads use the SAME swizzled
-    global offsets and LDS destinations as G2SLoader, so S2R is unchanged."""
-
-    def __init__(self, gl_rsrc, gl_offsets, n_load_steps, lds_dtype, wave_id, inv_scale):
-        self.gl_rsrc = gl_rsrc  # bf16 buffer resource
-        self.gl_offsets = gl_offsets
-        self.n_load_steps = n_load_steps
-        self.wave_id = wave_id
-        self.inv_scale = inv_scale
-        self.n_waves = fx.block_dim.x // 64
-        self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
-
-    def _load_cast_store(self, lds_dst, k_offset, step):
-        off = self.gl_offsets[step] + k_offset  # element offset (bf16 == fp8 count)
-        parts = []
-        for j in range_constexpr(4):
-            v = buffer_ops.buffer_load(
-                self.gl_rsrc, fx.Int32(off + j * 4), vec_width=4, dtype=fx.BFloat16.ir_type
-            )
-            parts.append(Vec(v))
-        v01 = parts[0].shuffle(parts[1], list(range(8)))
-        v23 = parts[2].shuffle(parts[3], list(range(8)))
-        v16 = v01.shuffle(v23, list(range(16)))  # 16 bf16
-        f = v16.to(fx.Float32) * self.inv_scale  # Vec 16 f32
-        # f32 -> e4m3 via hardware cvt_pk_fp8_f32 (2 f32 -> 2 fp8 per call) -> 4 i32 words,
-        # written to LDS at base + lane*16 (matches buffer_load_lds dwordx4 lane layout).
-        i32t = fx.Int32.ir_type
-        c0 = fx.Int32(0)
-        lane_id = fx.thread_idx.x % 64
-        step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
-        base = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + fx.Int32(step_off) + lane_id * fx.Int32(16)
-        I32Ptr_t = fx.PointerType.get(fx.Int32.ir_type, 2, 512)
-        ws = []
-        for w in range_constexpr(4):
-            pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 0], f[4 * w + 1], c0, 0)
-            pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 2], f[4 * w + 3], pw, 1)
-            ws.append(Vec.filled(1, fx.Int32(pw), fx.Int32))
-        v4 = ws[0].shuffle(ws[1], [0, 1]).shuffle(ws[2].shuffle(ws[3], [0, 1]), [0, 1, 2, 3])
-        view = fx.make_view(fx.inttoptr(I32Ptr_t, base), fx.make_layout(4, 1))
-        fx.memref_store_vec(v4, view)
-
-    def load(self, lds_dst, k_offset):
-        for step in range_constexpr(self.n_load_steps):
-            self._load_cast_store(lds_dst, k_offset, step)
-
-    def load_one(self, lds_dst, k_offset, step):
-        self._load_cast_store(lds_dst, k_offset, step)
-
-
 class StoreCScalar:
     """Tensorwise (scalar) output dequant store: out = (acc * scale).to(bf16),
     scale = a_scale * b_scale (both scalar)."""
@@ -453,6 +400,58 @@ def compile_fp8_gemm_4w(
 
         gl_off_a = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=False)
         gl_off_b = compute_global_swizzle(lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=b_preshuffled)
+
+        class FusedQuantG2SLoader:
+            """Like G2SLoader but reads a BF16 global tensor, casts to FP8 in-register
+            (x * inv_scale -> e4m3), and writes FP8 to LDS. Eliminates the separate
+            dynamic-quant cast pass; the cast VALU overlaps the MFMA chain. ``inv_scale``
+            is a runtime scalar (1 / tensorwise-quant-scale). Reads use the SAME swizzled
+            global offsets and LDS destinations as G2SLoader, so S2R is unchanged."""
+
+            def __init__(self, gl_rsrc, gl_offsets, n_load_steps, lds_dtype, wave_id, inv_scale):
+                self.gl_rsrc = gl_rsrc  # bf16 buffer resource
+                self.gl_offsets = gl_offsets
+                self.n_load_steps = n_load_steps
+                self.wave_id = wave_id
+                self.inv_scale = inv_scale
+                self.n_waves = fx.block_dim.x // 64
+                self.LdsPtr_t = fx.PointerType.get(lds_dtype, 2, 512)
+
+            def _load_cast_store(self, lds_dst, k_offset, step):
+                off = self.gl_offsets[step] + k_offset  # element offset (bf16 == fp8 count)
+                parts = []
+                for j in range_constexpr(4):
+                    v = buffer_ops.buffer_load(
+                        self.gl_rsrc, fx.Int32(off + j * 4), vec_width=4, dtype=fx.BFloat16.ir_type
+                    )
+                    parts.append(Vec(v))
+                v01 = parts[0].shuffle(parts[1], list(range(8)))
+                v23 = parts[2].shuffle(parts[3], list(range(8)))
+                v16 = v01.shuffle(v23, list(range(16)))  # 16 bf16
+                f = v16.to(fx.Float32) * self.inv_scale  # Vec 16 f32
+                # f32 -> e4m3 via hardware cvt_pk_fp8_f32 (2 f32 -> 2 fp8 per call) -> 4 i32 words,
+                # written to LDS at base + lane*16 (matches buffer_load_lds dwordx4 lane layout).
+                i32t = fx.Int32.ir_type
+                c0 = fx.Int32(0)
+                lane_id = fx.thread_idx.x % 64
+                step_off = self.wave_id * 1024 + step * (self.n_waves * 1024)
+                base = fx.Int32(fx.ptrtoint(lds_dst.ptr)) + fx.Int32(step_off) + lane_id * fx.Int32(16)
+                I32Ptr_t = fx.PointerType.get(fx.Int32.ir_type, 2, 512)
+                ws = []
+                for w in range_constexpr(4):
+                    pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 0], f[4 * w + 1], c0, 0)
+                    pw = fx.rocdl.cvt_pk_fp8_f32(i32t, f[4 * w + 2], f[4 * w + 3], pw, 1)
+                    ws.append(Vec.filled(1, fx.Int32(pw), fx.Int32))
+                v4 = ws[0].shuffle(ws[1], [0, 1]).shuffle(ws[2].shuffle(ws[3], [0, 1]), [0, 1, 2, 3])
+                view = fx.make_view(fx.inttoptr(I32Ptr_t, base), fx.make_layout(4, 1))
+                fx.memref_store_vec(v4, view)
+
+            def load(self, lds_dst, k_offset):
+                for step in range_constexpr(self.n_load_steps):
+                    self._load_cast_store(lds_dst, k_offset, step)
+
+            def load_one(self, lds_dst, k_offset, step):
+                self._load_cast_store(lds_dst, k_offset, step)
 
         if const_expr(fuse_q):
             a_g2s = FusedQuantG2SLoader(a_rsrc, gl_off_a, N_TILES_A, F8_IR_t, wave_id, inv_a)
