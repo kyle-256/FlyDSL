@@ -27,6 +27,7 @@ from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import ArithValue
 from kernels.fp8_gemm_utils import (
+    mask_a_tail,
     G2SLoader,
     S2RLoader,
     StoreC,
@@ -169,6 +170,7 @@ def compile_fp8_gemm_4w(
     agpr_alloc: int = 0,  # 0=auto (asm modes force 16*N_ACCUMS AGPRs, required for correctness); N>0 force "N,N"; -N allow "0,N"
     asm_mma: int = 2,  # 2=AGPR in-place inline-asm MFMA (kills accvgpr shuffle, default); 0=atom; 3=VGPR in-place
     fuse_q: bool = False,  # True: A/B are BF16; tensorwise-quant cast (x*inv_scale->e4m3 via cvt_pk_fp8_f32) fused into G2S; A_scale/B_scale are scalar quant scales. CORRECT (SNR 55) but ~1.5-2x SLOWER than separate quant+gemm: inline cvt VALU doesn't overlap MFMA, so the dedicated peak-BW quant kernel wins. Kept as reference; fusion is net-negative here.
+    tw_scalar: bool = False,  # True: fp8 inputs (NOT fused) + tensorwise scalar dequant store (A_scale/B_scale scalar). Production tensorwise dense/grouped path.
 ):
     # MFMA atom is 16x16x128; 4 waves in a 2x2 config require BLOCK >= 64.
     BLOCK_K = 128
@@ -176,9 +178,11 @@ def compile_fp8_gemm_4w(
     LDS_BLOCK_N = BLOCK_N // 2
 
     assert BLOCK_M >= 64 and BLOCK_M % 64 == 0 and BLOCK_N >= 64 and BLOCK_N % 64 == 0
-    assert K % BLOCK_K == 0
-
-    K_ITERS = K // BLOCK_K
+    # Native K-tail: ceil(K/128) iters; final block's invalid K-cols (>=K_TAIL)
+    # zeroed on A via mask_a_tail. One kernel handles any K (no sub-kernel dispatch).
+    K_ITERS = (K + BLOCK_K - 1) // BLOCK_K
+    K_TAIL = K % BLOCK_K
+    assert K_ITERS >= 2, f"need K>=129 (ceil(K/128)>=2), got K_ITERS={K_ITERS}"
     # Number of 16-row 16x128 tiles per wave per A/B partition.
     N_TILES_A = BLOCK_M // 4 // 16
     N_TILES_B = BLOCK_N // 4 // 16
@@ -257,6 +261,13 @@ def compile_fp8_gemm_4w(
             gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
             ga_div = fx.logical_divide(gA, fx.make_layout(1, 1))
             gb_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+            if const_expr(tw_scalar):
+                # tensorwise scalar dequant: out_scale = a_scale * b_scale (both scalar)
+                sa_rsrc = buffer_ops.create_buffer_resource(A_scale, max_size=False, num_records_bytes=4)
+                sb_rsrc = buffer_ops.create_buffer_resource(B_scale, max_size=False, num_records_bytes=4)
+                a_scale_v = ArithValue(buffer_ops.buffer_load(sa_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Float32.ir_type))
+                b_scale_v = ArithValue(buffer_ops.buffer_load(sb_rsrc, fx.Int32(0), vec_width=1, dtype=fx.Float32.ir_type))
+                out_scale = a_scale_v * b_scale_v
 
         def _compute_lds_swizzle(s2r, preshuffled=False):
             lds_swz = []
@@ -461,7 +472,7 @@ def compile_fp8_gemm_4w(
             b_g2s = G2SLoader(gb_div, gl_off_b, N_TILES_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_i, N_TILES_A)
         b_s2r = S2RLoader(wave_j, N_TILES_B)
-        if const_expr(fuse_q):
+        if const_expr(fuse_q or tw_scalar):
             store_c = StoreCScalar(out_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
         else:
             store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
@@ -564,6 +575,10 @@ def compile_fp8_gemm_4w(
         wait_barrier(0)
         b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
         a1_frag = a_s2r.load(a_cur1)
+        # final K-block = the tail: zero A's invalid K-columns (>= K_TAIL) so they
+        # contribute 0 to the mfma (no-op when K_TAIL==0).
+        a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
+        a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
         c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)

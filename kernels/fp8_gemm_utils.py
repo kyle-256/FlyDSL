@@ -232,3 +232,33 @@ class Mfma16x16x128:
         assert i < self.n_tiles_a and j < self.n_tiles_b
 
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
+
+
+def _a_tail_mask_vec(lane_id, r):
+    """Per-lane i32x8 byte-mask zeroing A-fragment bytes whose K-column >= r
+    (r in [1,128)). AND-ing it into the A frag drops the K-tail terms (a_k=0)
+    so the mfma ignores k>=r regardless of B. Layout matches mfma_16x16x128 A op."""
+    col0 = (lane_id // 16) * 16  # runtime, in {0,16,32,48}
+    words = []
+    for w in range_constexpr(8):
+        run_off = 0 if w < 4 else 64
+        ww = w if w < 4 else w - 4
+        base = col0 + (run_off + 4 * ww)  # K-column of byte 0 of this word
+        word = fx.Int32(0)
+        for b in range_constexpr(4):
+            valid = (base + fx.Int32(b)) < fx.Int32(r)
+            cval = 0xFF << (8 * b)
+            if cval >= (1 << 31):
+                cval -= 1 << 32
+            word = word + arith.select(valid, fx.Int32(cval), fx.Int32(0))
+        words.append(word)
+    return Vec.from_elements(words, fx.Int32)
+
+
+def mask_a_tail(frag_list, lane_id, r):
+    """Return A frags with the K-tail (>= r) zeroed; r%128==0 -> unchanged (no-op,
+    so one kernel handles any K). r = K % 128."""
+    if r % 128 == 0:
+        return frag_list
+    mask = _a_tail_mask_vec(lane_id, r % 128)
+    return [f & mask for f in frag_list]
