@@ -23,6 +23,7 @@ from kernels.fp8_gemm_utils import (
     compute_global_swizzle,
     divmod,
     make_fp8_buffer_tensor,
+    mask_a_tail,
     wait_barrier,
 )
 
@@ -89,9 +90,11 @@ def compile_fp8_gemm_8w(
     BLOCK_K = 128
 
     assert BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
-    assert K % BLOCK_K == 0
-
-    K_ITERS = K // BLOCK_K
+    # Native K-tail: ceil(K/128) iters; final block's invalid K-cols (>=K_TAIL)
+    # zeroed on A via mask_a_tail. One kernel handles any K (no sub-kernel dispatch).
+    K_ITERS = (K + BLOCK_K - 1) // BLOCK_K
+    K_TAIL = K % BLOCK_K
+    assert K_ITERS >= 2, f"need K>=129 (ceil(K/128)>=2), got K_ITERS={K_ITERS}"
 
     N_TILES_A = BLOCK_M // 64
     N_TILES_B = BLOCK_N // 128
@@ -288,6 +291,9 @@ def compile_fp8_gemm_8w(
         k = K_ITERS - 1
         a0_frag = a_s2r.load(a_cur0)
         wait_barrier(0)
+        # final K-block = the tail: zero A's invalid K-columns (>= K_TAIL) so they
+        # contribute 0 to the mfma regardless of B (no-op when K_TAIL == 0).
+        a0_frag = mask_a_tail(a0_frag, lane_id, K_TAIL)
 
         rocdl.s_setprio(1)
         c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
@@ -303,6 +309,7 @@ def compile_fp8_gemm_8w(
         rocdl.s_barrier()
 
         a1_frag = a_s2r.load(a_cur1)
+        a1_frag = mask_a_tail(a1_frag, lane_id, K_TAIL)
         rocdl.s_barrier()
 
         rocdl.s_setprio(1)
