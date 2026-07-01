@@ -447,6 +447,61 @@ class MfmaScaleFp4:
         r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
         return [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(Nacc)]
 
+    def call_packed_asm_wide(self, a, b, c, sa, sb, n_sub, _cache={}):
+        """General packed-scale asm MFMA cluster for the WIDE 1x4 tile (single N-slice,
+        nta*ntb accs). Generalises call_packed_asm to G_A=ceil(nta/4) A scale dwords AND
+        G_B=ceil(ntb/4) B scale dwords: sa[s][i//4] opsel i%4, sb[s][j//4] opsel j%4.
+        accs =a AGPR tied; opaque (no intrinsic auto-vmcnt(0) -> operand/scale loads
+        overlap MFMA). a[i][s]/b[j][s] i32x4 (pad=False), sa[s][g]/sb[s][g] i32."""
+        assert self.packed
+        nta, ntb = self.n_tiles_a, self.n_tiles_b
+        Nacc = nta * ntb
+        na, nb = nta * n_sub, ntb * n_sub
+        G_A = (nta + 3) // 4
+        G_B = (ntb + 3) // 4
+        nsa, nsb = G_A * n_sub, G_B * n_sub
+        _agpr = __import__("os").environ.get("FP4_AGPR", "1") == "1"
+        key = ("wide", nta, ntb, n_sub, _agpr)
+        if key not in _cache:
+            base_a = Nacc
+            base_b = base_a + na
+            base_sa = base_b + nb
+            base_sb = base_sa + nsa
+            L = []
+            for s in range(n_sub):
+                for i in range(nta):
+                    for j in range(ntb):
+                        q = i * ntb + j
+                        oa, ob = i % 4, j % 4
+                        sa_op = base_sa + s * G_A + i // 4
+                        sb_op = base_sb + s * G_B + j // 4
+                        osel = (f"op_sel:[{oa & 1},{ob & 1},0] "
+                                f"op_sel_hi:[{(oa >> 1) & 1},{(ob >> 1) & 1},0]")
+                        L.append(f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${base_a + i * n_sub + s}, "
+                                 f"${base_b + j * n_sub + s}, ${q}, ${sa_op}, ${sb_op} {osel} cbsz:4 blgp:4")
+            _ac = "=a" if _agpr else "=v"
+            cons = ",".join([_ac] * Nacc + ["v"] * (na + nb + nsa + nsb) + [str(q) for q in range(Nacc)])
+            st = "!llvm.struct<(" + ", ".join(["vector<4xf32>"] * Nacc) + ")>"
+            _cache[key] = ("\n".join(L), cons, st)
+        asm, cons, st = _cache[key]
+        ins = []
+        for i in range_constexpr(nta):
+            for s in range_constexpr(n_sub):
+                ins.append(_raw(a[i][s]))
+        for j in range_constexpr(ntb):
+            for s in range_constexpr(n_sub):
+                ins.append(_raw(b[j][s]))
+        for s in range_constexpr(n_sub):
+            for g in range_constexpr(G_A):
+                ins.append(_raw(sa[s][g]))
+        for s in range_constexpr(n_sub):
+            for g in range_constexpr(G_B):
+                ins.append(_raw(sb[s][g]))
+        for q in range_constexpr(Nacc):
+            ins.append(_raw(c[q]))
+        r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+        return [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(Nacc)]
+
     def call_packed_asm2(self, a, bl, br, cL, cR, sa, sbl, sbr, n_sub, _cache={}):
         """Combined 2-N-slice 128-MFMA asm cluster (accL+accR in ONE block, 64 accs =a
         AGPR). Removes the accL->accR boundary gap a 2-cluster split leaves, and is the
@@ -1034,7 +1089,7 @@ class MfmaScaleFp4:
                         r.append(f"ds_read_b32 ${t_sc + slot+off}, ${i_scrb[buf]} offset:{slot*256}")
                 return r
 
-            _MMORD = int(__import__("os").environ.get("FP4_MMORD", "0"))  # mfma emission order (bank-conflict probe)
+            _MMORD = int(__import__("os").environ.get("FP4_MMORD", "5"))  # mfma emission order (bank-conflict probe)
             def emit_mm(off=0):
                 r = []
                 def one(sl, tb, sbfn, s, ii, ji):
@@ -1076,11 +1131,14 @@ class MfmaScaleFp4:
                                     r.append(one(sl, tb, sbfn, s, ii, ji))
                 return r
 
+            _AONLYG2S = int(__import__("os").environ.get("FP4_WIDEWL_AONLYG2S", "0"))  # probe: skip B g2s (isolate B LDS-write wall)
             def emit_g2s(buf, sa_op, sbl_op, sbr_op):
                 r = []
                 for st in range(nsa):
                     r.append(f"s_add_u32 m0, ${i_g_ab[buf]}, {st*_NWc*1024}\n"
                              f"buffer_load_dwordx4 ${i_gla[st]}, ${i_rsa}, ${sa_op} offen lds")
+                if _AONLYG2S:
+                    return r
                 for st in range(nsb):
                     r.append(f"s_add_u32 m0, ${i_g_blb[buf]}, {st*_NWc*1024}\n"
                              f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sbl_op} offen lds")
@@ -1329,7 +1387,7 @@ class MfmaScaleFp4:
                 # BOTH A[ii] and B[col] free progressively (each refilled mid-loop). side="A"/"B":
                 # one side progressive (other end-drained). Accs order-independent -> reorder safe.
                 cells = []   # (ii, sl, ji)
-                _mmo = int(__import__("os").environ.get("FP4_MMORD", "0"))
+                _mmo = int(__import__("os").environ.get("FP4_MMORD", "5"))
                 _mm3 = _mmo in (3, 4, 5)
                 if side == "DIAG" and _mm3:
                     # BLOCKED DIAGONAL: both-progressive free (DIAG hide) + N-chain throughput +
@@ -1388,7 +1446,7 @@ class MfmaScaleFp4:
                                 col = d - ii
                                 if 0 <= col < ncol:
                                     cells.append((ii, col // ntb, col % ntb, s))
-                elif int(__import__("os").environ.get("FP4_MMORD", "0")) == 3:
+                elif int(__import__("os").environ.get("FP4_MMORD", "5")) == 3:
                     # aiter 2x2 register-block (throughput) + A-progressive (side A hides A): block ii,ji
                     for sl in (0, 1):
                         for s in range(n_sub):
@@ -1653,7 +1711,7 @@ class MfmaScaleFp4:
                 def ss_bl(ss, ji): return NT + ss * sub_sz + nta + ji
                 def ss_br(ss, ji): return NT + ss * sub_sz + nta + ntb + ji
                 def ss_sc(ss, g): return NT + ss * sub_sz + nfs + g   # g: 0=A-g0,1=A-g1,2=BL,3=BR
-                _ssmm3 = int(__import__("os").environ.get("FP4_MMORD", "0")) == 3
+                _ssmm3 = int(__import__("os").environ.get("FP4_MMORD", "5")) == 3
                 def emit_mm_ss(ss):
                     r = []
                     def _emit(sl, bget, scg, ii, ji):
@@ -2332,6 +2390,289 @@ class MfmaScaleFp4:
         r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
         o = [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(nq * 2)]
         return o[:nq], o[nq:]
+
+    def call_mxfp4_wholeloop_wide(self, a_base, b_base, ts_a, ts_b,
+                                  abase, bbase, gl_a, gl_b, rsrc_a, rsrc_b,
+                                  kstep, cAcc, n_sub, nsa, nsb, nval,
+                                  soff0_a, soff0_b,
+                                  sc_rb, sc_gb, sc_rsa, sc_rsb, sc_voff, sc_soff0, _cache={}):
+        """WHOLE-LOOP bare-asm for the WIDE 1x4 tile (single acc set, single B slab).
+
+        The ENTIRE K-loop is ONE inline-asm hw-loop (no per-iter FlyDSL boundary /
+        operand passing -> the +16% lever the 2899 per-iter wide kernel lost). nta*ntb
+        accs (=a AGPR, tied). 2 LDS buffers ping-pong (buf0/buf1), unroll-2 refill-SAME
+        (read buf, refill same buf 2-ahead). Scales are PACKED (preshuffle_scale_packed)
+        loaded DIRECT to VGPR by 4 buffer_load_dword/phase (A-g0,A-g1,B-g0,B-g1), each an
+        advancing soffset chain (+n_sub*256/phase), voffset lane*4. MFMA selects
+        sa[i//4]/sb[j//4] via op_sel i%4 / j%4.
+
+        a_base[b][s]/b_base[b][s]: ds_read LDS addrs (b=buf0/1). abase[b]/bbase[b]:
+        per-wave G2S LDS dest base SGPR (m0 = base + step*NW*1024). gl_a[st]/gl_b[st]:
+        per-lane gmem voffsets. rsrc_a/b: operand buffer resources. sc_rsa/sc_rsb: packed
+        A/B scale buffer resources. sc_soff0 = [A-g0,A-g1,B-g0,B-g1] soffset inits (k=0).
+        soff0_a/soff0_b: operand gmem soffset init (= 2-ahead refill target, k=2*KSTEP).
+        Requires n_sub==1 and even KI (7b-qkv K=4096 -> KI=32). Returns acc list."""
+        assert self.packed and n_sub == 1
+        nta, ntb = self.n_tiles_a, self.n_tiles_b
+        nq = nta * ntb
+        na, nb = nta * n_sub, ntb * n_sub
+        nsct = 4 * n_sub                                # A-g0,A-g1,B-g0,B-g1 (n_sub each)
+        _NWc = 4
+        nbuf = len(a_base)
+        _WLV = int(__import__("os").environ.get("FP4_WIDEWL_VMCN", "14"))
+        _NOBAR = int(__import__("os").environ.get("FP4_WIDEWL_NOBAR", "0"))
+        _1BAR = int(__import__("os").environ.get("FP4_WIDEWL_1BAR", "0"))  # 1 barrier/body (phase A no barrier)
+        _DB = int(__import__("os").environ.get("FP4_WIDEWL_DB", "0"))      # reg double-buffer ds_read prefetch
+        _BPF = int(__import__("os").environ.get("FP4_WIDEWL_BPF", "0"))    # B: gmem->VGPR 1-ahead prefetch (aiter-style, A stays LDS)
+        _BPFV = int(__import__("os").environ.get("FP4_WIDEWL_BPFV", "6"))  # vmcnt floor before mfma (B[cur] drain), A-refill in flight
+        key = ("widewl", nta, ntb, n_sub, nsa, nsb, ts_a, ts_b, nbuf, _WLV, _NOBAR, _1BAR, _DB, _BPF, _BPFV)
+        if key not in _cache:
+            NT = nq
+            nsets = 2 if (_DB or _BPF) else 1
+            setsz = na + nb + nsct
+            ntmp = nsets * setsz
+            o_cnt = NT + ntmp
+            o_sa = o_cnt + 1; o_sb = o_sa + 1; o_ta = o_sb + 1; o_tb = o_ta + 1
+            o_sc = [o_tb + 1 + g for g in range(nsct)]     # 4 advancing scale soffsets
+            nout = o_sc[-1] + 1
+            i = nout
+            i_ab = [[i + b * n_sub + s for s in range(n_sub)] for b in range(nbuf)]; i += nbuf * n_sub
+            i_bb = [[i + b * n_sub + s for s in range(n_sub)] for b in range(nbuf)]; i += nbuf * n_sub
+            i_ga = [i + b for b in range(nbuf)]; i += nbuf
+            i_gb = [i + b for b in range(nbuf)]; i += nbuf
+            i_gla = [i + st for st in range(nsa)]; i += nsa
+            i_glb = [i + st for st in range(nsb)]; i += nsb
+            i_rsa = i; i += 1; i_rsb = i; i += 1
+            i_kstep = i; i += 1
+            i_nval = i; i += 1
+            i_sa0 = i; i += 1; i_sb0 = i; i += 1
+            i_scrb = [i + b for b in range(nbuf)]; i += nbuf   # scale LDS read base (per buf)
+            i_scgb = [i + b for b in range(nbuf)]; i += nbuf   # scale LDS g2s dest base (per buf)
+            i_scrsa = i; i += 1; i_scrsb = i; i += 1           # packed scale gmem rsrc A/B
+            i_scvoff = i; i += 1                               # gmem per-lane scale voffset (lane*4)
+            i_sc0 = [i + g for g in range(nsct)]; i += nsct    # scale gmem soffset inits (refill k=2)
+
+            def t_a(ss): return NT + ss * setsz
+            def t_b(ss): return NT + ss * setsz + na
+            def t_sc(ss): return NT + ss * setsz + na + nb
+            def sa_t(ss, g): return t_sc(ss) + g * n_sub          # A group g (0/1)
+            def sb_t(ss, g): return t_sc(ss) + 2 * n_sub + g * n_sub
+
+            _BVGPR = int(__import__("os").environ.get("FP4_WIDEWL_BVGPR", "0"))  # B: gmem->VGPR direct (skip B LDS write+ds_read)
+            def emit_ds(buf, ss):
+                r = []
+                for ii in range(nta):
+                    for s in range(n_sub):
+                        r.append(f"ds_read_b128 ${t_a(ss) + ii*n_sub+s}, ${i_ab[buf][s]} offset:{ii*ts_a}")
+                if not (_BVGPR or _BPF):
+                    for ji in range(ntb):
+                        for s in range(n_sub):
+                            r.append(f"ds_read_b128 ${t_b(ss) + ji*n_sub+s}, ${i_bb[buf][s]} offset:{ji*ts_b}")
+                # scales from SC_lds[buf] (lgkmcnt, decoupled from g2s vmcnt): slot @ slot*256 B
+                for slot in range(nsct):
+                    r.append(f"ds_read_b32 ${t_sc(ss) + slot}, ${i_scrb[buf]} offset:{slot*256}")
+                return r
+
+            def emit_b_load(ss, sb_op):
+                # B direct gmem->VGPR (b128/tile). reuse gl_b[ji] per-tile voffset, sb_op soffset.
+                return [f"buffer_load_dwordx4 ${t_b(ss) + ji*n_sub+s}, ${i_glb[(ji*n_sub+s) % nsb]}, ${i_rsb}, ${sb_op} offen"
+                        for ji in range(ntb) for s in range(n_sub)]
+
+            def emit_scale_g2s(buf):
+                # refill SC_lds[buf] 2-ahead: 4 packed scale dwords (A-g0,A-g1@rsa; B-g0,B-g1@rsb)
+                # gmem->LDS (buffer_load_dword...lds, vmcnt), m0 = i_scgb[buf] + slot*256.
+                r = []
+                for g in range(nsct):
+                    rsrc = i_scrsa if g < 2 else i_scrsb
+                    r.append(f"s_add_u32 m0, ${i_scgb[buf]}, {g*256}\n"
+                             f"buffer_load_dword ${i_scvoff}, ${rsrc}, ${o_sc[g]} offen lds")
+                return r
+
+            def emit_mm(ss):
+                r = []
+                for s in range(n_sub):
+                    for ii in range(nta):
+                        for ji in range(ntb):
+                            q = ii * ntb + ji
+                            oa, ob = ii % 4, ji % 4
+                            osel = (f"op_sel:[{oa & 1},{ob & 1},0] "
+                                    f"op_sel_hi:[{(oa >> 1) & 1},{(ob >> 1) & 1},0]")
+                            r.append(f"v_mfma_scale_f32_16x16x128_f8f6f4 ${q}, ${t_a(ss)+ii*n_sub+s}, "
+                                     f"${t_b(ss)+ji*n_sub+s}, ${q}, ${sa_t(ss,ii//4)}, ${sb_t(ss,ji//4)} {osel} cbsz:4 blgp:4")
+                return r
+
+            _AONLYG2S = int(__import__("os").environ.get("FP4_WIDEWL_AONLYG2S", "0"))  # probe: skip B g2s (isolate B LDS-write wall)
+            _HALFB = int(__import__("os").environ.get("FP4_WIDEWL_HALFB", "0"))         # probe: half B g2s
+            def emit_g2s(buf, sa_op, sb_op):
+                r = []
+                for st in range(nsa):
+                    r.append(f"s_add_u32 m0, ${i_ga[buf]}, {st*_NWc*1024}\n"
+                             f"buffer_load_dwordx4 ${i_gla[st]}, ${i_rsa}, ${sa_op} offen lds")
+                if _AONLYG2S or _BVGPR or _BPF:
+                    return r
+                _nsb = (nsb // 2) if _HALFB else nsb
+                for st in range(_nsb):
+                    r.append(f"s_add_u32 m0, ${i_gb[buf]}, {st*_NWc*1024}\n"
+                             f"buffer_load_dwordx4 ${i_glb[st]}, ${i_rsb}, ${sb_op} offen lds")
+                return r
+
+            _scstep = n_sub * 256
+            _bar = "" if _NOBAR else "\ns_barrier"
+            _endph = f"s_waitcnt vmcnt({_WLV}){_bar}"
+            _endpha = f"s_waitcnt vmcnt({_WLV})" if _1BAR else _endph  # phase A: no barrier when 1BAR
+
+            def interleave(mm, tail):
+                # spread g2s buffer_loads evenly through the MFMA stream so their VMEM
+                # latency overlaps MFMA compute (vs emitting them all after -> serial).
+                if not tail:
+                    return list(mm)
+                o = []; gi = 0; ng = max(len(mm) // max(len(tail), 1), 1)
+                for mi, m in enumerate(mm):
+                    o.append(m)
+                    if gi < len(tail) and mi % ng == 0:
+                        o.append(tail[gi]); gi += 1
+                while gi < len(tail):
+                    o.append(tail[gi]); gi += 1
+                return o
+
+            def scale_adv():
+                return [f"s_add_u32 ${o_sc[g]}, ${o_sc[g]}, {_scstep}" for g in range(nsct)]
+
+            _NODSR = int(__import__("os").environ.get("FP4_WIDEWL_NODSR", "0"))  # ceiling probe: skip ds_read
+            _NOG2S = int(__import__("os").environ.get("FP4_WIDEWL_NOG2S", "0"))  # ceiling probe: skip g2s+barrier
+
+            def phase_simple(buf, sa_op, sb_op, endph):
+                # non-DB: ds_read this phase's ops+scales, wait lgkmcnt(0), mfma||g2s.
+                L = [] if _NODSR else emit_ds(buf, 0)
+                if _BVGPR:
+                    L += emit_b_load(0, sb_op)          # B gmem->VGPR direct (no LDS)
+                    L.append("s_waitcnt lgkmcnt(0) vmcnt(0)")  # A+scale(lgkm) & B(vmcnt) ready
+                else:
+                    L.append("s_waitcnt lgkmcnt(0)")
+                tail = [] if _NOG2S else (emit_g2s(buf, sa_op, sb_op) + emit_scale_g2s(buf))
+                L += interleave(emit_mm(0), tail)
+                L.append("" if _NOG2S else endph)
+                L += scale_adv()
+                return L
+
+            _FRONT = int(__import__("os").environ.get("FP4_WIDEWL_FRONT", "1"))
+
+            def phase_db(rbuf, cset, pbuf, pset, sa_op, sb_op, endph):
+                # DB: mfma from cset (already prefetched). During mfma, PREFETCH pset<-pbuf
+                # (next phase's operands+scales) so its ds_read latency hides in this mfma.
+                # Refill rbuf 2-ahead. FRONT: issue rbuf's refill g2s BEFORE mfma so it has the
+                # whole phase (mfma+barrier) to land before rbuf is prefetched next phase (fixes
+                # the WLV>0 race where late-issued refill wasn't landed at the 1-ahead prefetch).
+                L = ["s_waitcnt lgkmcnt(0)"]   # cset ready (prefetched last phase / prologue)
+                refill = emit_g2s(rbuf, sa_op, sb_op) + emit_scale_g2s(rbuf)
+                if _FRONT:
+                    L += refill
+                    L += interleave(emit_mm(cset), emit_ds(pbuf, pset))
+                else:
+                    L += interleave(emit_mm(cset), emit_ds(pbuf, pset) + refill)
+                L.append(endph)
+                L += scale_adv()
+                return L
+
+            _BPFAP = int(__import__("os").environ.get("FP4_WIDEWL_BPFAP", "0"))  # also prefetch A ds_read 1-ahead
+            def phase_bpf(cur, nxt, buf_nxt, buf_refill, sa_op, sb_op_nxt, endph):
+                # aiter-style: A via LDS, B prefetched gmem->VGPR 1-ahead (hides HBM behind mfma).
+                # Default: A ds_read SAME phase (LDS latency short, lgkmcnt cheap) -> best (3532);
+                # _BPFAP=1 also prefetches A 1-ahead (2 reg sets -> reg pressure, usually worse).
+                if _BPFAP:
+                    L = [f"s_waitcnt vmcnt({_BPFV}) lgkmcnt(0)"]      # cur ready (prefetched last phase)
+                    tail = (emit_b_load(nxt, sb_op_nxt)              # B[nxt] first (front-loaded, max land time)
+                            + emit_ds(buf_nxt, nxt)                  # A[nxt] ds_read + scale
+                            + emit_g2s(buf_refill, sa_op, sa_op) + emit_scale_g2s(buf_refill))
+                else:
+                    L = emit_ds(buf_refill, cur)                     # A[cur] ds_read SAME phase (buf_refill==cur's buf)
+                    L.append(f"s_waitcnt vmcnt({_BPFV}) lgkmcnt(0)") # A ready; B[cur] (loaded last phase) drained
+                    tail = (emit_b_load(nxt, sb_op_nxt)              # B[nxt] front-loaded (hides HBM in mfma)
+                            + emit_g2s(buf_refill, sa_op, sa_op) + emit_scale_g2s(buf_refill))
+                L += interleave(emit_mm(cur), tail)
+                L.append(endph)
+                L += scale_adv()
+                return L
+
+            L = [f"s_mov_b32 ${o_cnt}, 0",
+                 f"s_mov_b32 ${o_sa}, ${i_sa0}", f"s_mov_b32 ${o_sb}, ${i_sb0}"]
+            for g in range(nsct):
+                L.append(f"s_mov_b32 ${o_sc[g]}, ${i_sc0[g]}")
+            if _BPF:
+                # prologue: A[set0] ds_read from buf0(k0) + scale; B[set0] load(k0). Both consumed
+                # by the first phase-A mfma. buf0/buf1 prefilled by host (k0/k1).
+                L += emit_ds(0, 0)
+                L += emit_b_load(0, o_sb)
+            elif _DB:
+                L += emit_ds(0, 0)   # prologue: set0 <- buf0 (k0), landed by first lgkmcnt(0)
+            L.append("1:")
+            if _BPF:
+                # phase A: mm set0 (buf0=k2t). prefetch A[set1]<-buf1(k2t+1)+B[set1]; refill buf0(k2t+2).
+                L += phase_bpf(0, 1, 1, 0, o_sa, o_sb, _endpha)
+                L.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
+                L.append(f"s_add_u32 ${o_tb}, ${o_sb}, ${i_kstep}")
+                # phase B: mm set1 (buf1=k2t+1). prefetch A[set0]<-buf0(k2t+2)+B[set0]; refill buf1(k2t+3).
+                L += phase_bpf(1, 0, 0, 1, o_ta, o_tb, _endph)
+            elif _DB:
+                # phase A: mm set0(buf0,k=2t); prefetch set1<-buf1(k=2t+1); refill buf0<-k=2t+2
+                L += phase_db(0, 0, 1, 1, o_sa, o_sb, _endpha)
+                # phase B: mm set1(buf1,k=2t+1); prefetch set0<-buf0(k=2t+2); refill buf1<-k=2t+3
+                L.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
+                L.append(f"s_add_u32 ${o_tb}, ${o_sb}, ${i_kstep}")
+                L += phase_db(1, 1, 0, 0, o_ta, o_tb, _endph)
+            else:
+                L += phase_simple(0, o_sa, o_sb, _endpha)
+                L.append(f"s_add_u32 ${o_ta}, ${o_sa}, ${i_kstep}")
+                L.append(f"s_add_u32 ${o_tb}, ${o_sb}, ${i_kstep}")
+                L += phase_simple(1, o_ta, o_tb, _endph)
+            L.append(f"s_add_u32 ${o_sa}, ${o_sa}, ${i_kstep}")
+            L.append(f"s_add_u32 ${o_sa}, ${o_sa}, ${i_kstep}")
+            L.append(f"s_add_u32 ${o_sb}, ${o_sb}, ${i_kstep}")
+            L.append(f"s_add_u32 ${o_sb}, ${o_sb}, ${i_kstep}")
+            L.append(f"s_add_u32 ${o_cnt}, ${o_cnt}, 2")
+            L.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
+            L.append("s_cbranch_scc1 1b")
+
+            cons = ",".join(
+                ["=a"] * NT + ["=&v"] * ntmp + ["=&s"] * 9
+                + ["v"] * (2 * nbuf * n_sub)          # a_base/b_base ds_read addrs
+                + ["s"] * (2 * nbuf)                  # abase/bbase g2s dest
+                + ["v"] * (nsa + nsb)                 # gl voffsets
+                + ["s", "s", "s", "s"]                # rsrc_a, rsrc_b, kstep, nval
+                + ["s", "s"]                          # soff0_a, soff0_b
+                + ["v"] * nbuf + ["s"] * nbuf         # scale LDS read base (v), g2s dest (s)
+                + ["s", "s", "v"]                     # sc_rsa, sc_rsb, sc_voff
+                + ["s"] * nsct                        # scale gmem soffset inits
+                + [str(q) for q in range(NT)])        # tied accs
+            st = "!llvm.struct<(" + ", ".join(
+                ["vector<4xf32>"] * NT
+                + (["vector<4xi32>"] * (na + nb) + ["i32"] * nsct) * nsets
+                + ["i32"] * 9) + ")>"
+            _cache[key] = ("\n".join(L), cons, st)
+        asm, cons, st = _cache[key]
+        ins = []
+        for b in range_constexpr(nbuf):
+            for s in range_constexpr(n_sub):
+                ins.append(_raw(a_base[b][s]))
+        for b in range_constexpr(nbuf):
+            for s in range_constexpr(n_sub):
+                ins.append(_raw(b_base[b][s]))
+        for b in range_constexpr(nbuf):
+            ins.append(_raw(abase[b]))
+        for b in range_constexpr(nbuf):
+            ins.append(_raw(bbase[b]))
+        for v in gl_a: ins.append(_raw(v))
+        for v in gl_b: ins.append(_raw(v))
+        ins.append(_raw(rsrc_a)); ins.append(_raw(rsrc_b))
+        ins.append(_raw(kstep)); ins.append(_raw(nval))
+        ins.append(_raw(soff0_a)); ins.append(_raw(soff0_b))
+        for b in range_constexpr(nbuf): ins.append(_raw(sc_rb[b]))
+        for b in range_constexpr(nbuf): ins.append(_raw(sc_gb[b]))
+        ins.append(_raw(sc_rsa)); ins.append(_raw(sc_rsb)); ins.append(_raw(sc_voff))
+        for g in range_constexpr(nsct): ins.append(_raw(sc_soff0[g]))
+        for q in range_constexpr(nq): ins.append(_raw(cAcc[q]))
+        r = _llvm.inline_asm(ir.Type.parse(st), ins, asm, cons, has_side_effects=True)
+        return [Vec(_llvm.extractvalue(ir.Type.parse("vector<4xf32>"), r, [q])) for q in range_constexpr(nq)]
 
     def call_mxfp4_wholeloop_8w(self, a0_base, a1_base, b0_base, b1_base, ts_a, ts_b,
                                 ag0, ag1, bg0, bg1, gl_a, gl_b, rsrc_a, rsrc_b,

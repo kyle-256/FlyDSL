@@ -41,6 +41,245 @@ from turbo.mxfp4_gemm_8wave import (
 )
 
 
+def preshuffle_mxfp4_scales_wide(a_e8m0, b_e8m0, K):
+    """Host scale prep for the wide (BM128xBN512, 1x4 N-split) kernel: both A and B
+    packed 4-tiles/dword (opsel selects the byte). A spans full 128 M (2 groups); each
+    wave's 128-N slab = 2 groups."""
+    return preshuffle_scale_packed(a_e8m0, K, 4), preshuffle_scale_packed(b_e8m0, K, 4)
+
+
+def compile_mxfp4_gemm_4w_wide(
+    *,
+    K: int,
+    BLOCK_M: int = 128,
+    BLOCK_N: int = 512,
+    block_k: int = 128,
+    group_m: int = 4,
+    num_xcds: int = 8,
+    group_n: int = 0,
+    swizzle: bool = True,
+    agpr: bool = True,
+    maxnreg: int = 0,
+    nbuf: int = 2,
+):
+    """WIDE 4-wave MXFP4 GEMM: BM128 x BN512, 1x4 N-split (aiter's 128x512 tile).
+
+    Each of the 4 waves computes the FULL 128 M-rows x its own 128-N slab (nta=8,
+    ntb=8 -> 64 accs = 256 AGPR). A LDS (128 rows, 8KB) is SHARED (all waves read it,
+    wave_idx=0); B LDS (512 rows, 32KB) holds all slabs (wave reads its own). The
+    square-per-wave (128x128) maximises operand reuse -> ~32 ds_read/256mfma (vs the
+    2x2 BM256 96 and the 2x2 BM128xBN512 80) which is why aiter picks 128x512 for
+    large-N short-K. BK128 double-buffer: LDS = nbuf*(8+32)KB = 80KB (occ=1, 256 AGPR).
+    Non-asm packed-scale (LLVM-scheduled); correctness-first, 1 s_barrier/iter."""
+    assert BLOCK_M == 128 and BLOCK_N == 512 and block_k == 128
+    assert K % block_k == 0
+    _apply_prod_defaults()
+    BLOCK_K = block_k
+    KI = K // BLOCK_K
+    N_SUB = BLOCK_K // 128            # 1
+    BPR = BLOCK_K // 2               # 64 packed-fp4 bytes / K-iter row
+    KSTEP = BPR
+    K2 = K // 2
+    NW = 4
+    WAVE_N = BLOCK_N // NW           # 128 N-cols / wave
+    N_TILES_A = BLOCK_M // 16        # 8 (full M per wave)
+    N_TILES_B = WAVE_N // 16         # 8 (wave's N slab)
+    G_A = ceildiv(N_TILES_A, 4)      # 2 packed A scale groups (64 rows each)
+    G_B = ceildiv(N_TILES_B, 4)      # 2 packed B scale groups
+    lpr = BPR // 16                  # 4 lanes/row
+    rows_per_step = 64 // lpr        # 16
+    ROWS = NW * rows_per_step        # 64 rows/G2S-step (all waves)
+    N_LDS_STEPS_A = BLOCK_M // ROWS  # 2
+    N_LDS_STEPS_B = BLOCK_N // ROWS  # 8
+    a_lds_size = BLOCK_M * BPR       # 8192 B
+    b_lds_size = BLOCK_N * BPR       # 32768 B
+    NBUF = nbuf
+
+    _SCW_WL = NW * 4 * N_SUB * 64        # SC_lds dwords/buffer (all waves, 4 groups, 64 lanes)
+    _anns = {}
+    for i in range_constexpr(NBUF):
+        _anns[f"A_lds{i}"] = fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        _anns[f"B_lds{i}"] = fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+    for i in range_constexpr(NBUF):
+        _anns[f"SC_lds{i}"] = fx.Array[fx.Int32, _SCW_WL, 16]
+    SharedWide = fx.struct(type("SharedWide", (), {"__annotations__": _anns}))
+
+    @flyc.kernel(known_block_size=[256, 1, 1])
+    def kernel_gemm_wide(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+    ):
+        F8_IR_t = fx.Float8E4M3FN.ir_type
+        lds = fx.SharedAllocator().allocate(SharedWide).peek()
+        A_buf = [getattr(lds, f"A_lds{i}") for i in range_constexpr(NBUF)]
+        B_buf = [getattr(lds, f"B_lds{i}") for i in range_constexpr(NBUF)]
+
+        lane_id = fx.thread_idx.x % 64
+        wave_id = fx.thread_idx.x // 64
+        block_m, block_n = grouped_xcd_pid(fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N,
+                                           group_m=group_m, num_xcds=num_xcds, group_n=group_n)
+
+        A_off = block_m * BLOCK_M * K2
+        B_off = block_n * BLOCK_N * K2
+
+        gA = make_fp8_buffer_tensor(A, F8_IR_t)
+        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
+        b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
+
+        gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR, swizzle=swizzle)
+
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, packed=True)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        # A shared across waves (all read full 128-M) -> wave_idx=0; B per-wave slab.
+        # pad=False (i32x4) for the asm MFMA cluster; True (i32x8) for the intrinsic path.
+        _NOASM = const_expr(int(__import__("os").environ.get("FP4_NOASM", "0")))
+        _padf = const_expr(bool(_NOASM))
+        a_s2r = S2RLoaderFp4(0, N_TILES_A, N_SUB, BPR, pad=_padf, swizzle=swizzle)
+        b_s2r = S2RLoaderFp4(wave_id, N_TILES_B, N_SUB, BPR, pad=_padf, swizzle=swizzle)
+
+        _qm = ((c_m + 63) // 64) * 64
+        _qn = ((c_n + 63) // 64) * 64
+        sa_s2r = ScaleS2RPacked(A_scale, _qm, K, 4)
+        sb_s2r = ScaleS2RPacked(B_scale, _qn, K, 4)
+        store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+
+        sa_base = fx.Int32(block_m * BLOCK_M)                     # full M (wave-independent)
+        sb_base = fx.Int32(block_n * BLOCK_N + wave_id * WAVE_N)  # wave's N slab
+
+        acc = [mfma.zero_value] * (N_TILES_A * N_TILES_B)
+
+        def _mfma_wide(a, b, c, sa, sb):
+            for s in range_constexpr(N_SUB):
+                for i in range_constexpr(N_TILES_A):
+                    for j in range_constexpr(N_TILES_B):
+                        idx = i * N_TILES_B + j
+                        c[idx] = mfma._do_packed(
+                            a[i][s], b[j][s], c[idx], sa[s][i // 4], i % 4, sb[s][j // 4], j % 4)
+            return c
+
+        _LEAN = const_expr(int(__import__("os").environ.get("FP4_LEANBAR", "0")))
+        _WIDEWL = const_expr(int(__import__("os").environ.get("FP4_WIDE_WL", "0")))
+        if const_expr(_WIDEWL):
+            assert KI % 2 == 0, "wide whole-loop requires even KI"
+            K128 = const_expr(K // 128)
+            _SCW = const_expr(4 * N_SUB * 64)          # SC_lds dwords/wave-region/buffer
+            SC_buf = [getattr(lds, f"SC_lds{b}") for b in range_constexpr(NBUF)]
+            rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K2)
+            rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * K2)
+            # scale group bases: A-g0,A-g1 (rows 0-63,64-127); B-g0,B-g1 (cols slab 0-63,64-127)
+            _scg = [sa_base, sa_base + fx.Int32(64), sb_base, sb_base + fx.Int32(64)]
+
+            def _sc_store(buf, slot, val):
+                idx = fx.Int32(wave_id) * fx.Int32(_SCW) + fx.Int32(slot * 64) + lane_id
+                primitive.ptr_store(val, fx.add_offset(SC_buf[buf].ptr, fx.make_int_tuple(idx)))
+            # prologue: operands buf0<-k0, buf1<-k1; scales SC_lds[0]<-k0, SC_lds[1]<-k1
+            a_g2s.load(A_buf[0], A_off + 0 * KSTEP)
+            b_g2s.load(B_buf[0], B_off + 0 * KSTEP)
+            a_g2s.load(A_buf[1], A_off + 1 * KSTEP)
+            b_g2s.load(B_buf[1], B_off + 1 * KSTEP)
+            for _bk in range_constexpr(NBUF):
+                _sc_store(_bk, 0, sa_s2r.load(_scg[0], _bk))
+                _sc_store(_bk, 1, sa_s2r.load(_scg[1], _bk))
+                _sc_store(_bk, 2, sb_s2r.load(_scg[2], _bk))
+                _sc_store(_bk, 3, sb_s2r.load(_scg[3], _bk))
+            _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
+                             constraints="", has_side_effects=True)
+            wait_barrier(0)
+            a_base = [[a_s2r.base_addr(A_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBUF)]
+            b_base = [[b_s2r.base_addr(B_buf[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(NBUF)]
+
+            def _gbase(buf):
+                v = fx.Int32(fx.ptrtoint(buf.ptr)) + fx.Int32(wave_id) * fx.Int32(1024)
+                return rocdl.readfirstlane(T.i32, v)
+            abase = [_gbase(A_buf[b]) for b in range_constexpr(NBUF)]
+            bbase = [_gbase(B_buf[b]) for b in range_constexpr(NBUF)]
+            gl_a6 = [fx.Int32(gl_off_a[st]) for st in range_constexpr(N_LDS_STEPS_A)]
+            gl_b6 = [fx.Int32(gl_off_b[st]) for st in range_constexpr(N_LDS_STEPS_B)]
+            soff0_a = rocdl.readfirstlane(T.i32, A_off + fx.Int32(2 * KSTEP))
+            soff0_b = rocdl.readfirstlane(T.i32, B_off + fx.Int32(2 * KSTEP))
+            # scale gmem soffset inits: refill target = k=2 (2-ahead), advancing +256/phase
+            sc_rb = [fx.ptrtoint(fx.add_offset(SC_buf[b].ptr,
+                     fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW) + lane_id)))
+                     for b in range_constexpr(NBUF)]
+            sc_gb = [rocdl.readfirstlane(T.i32, fx.Int32(fx.ptrtoint(fx.add_offset(SC_buf[b].ptr,
+                     fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW))))))
+                     for b in range_constexpr(NBUF)]
+
+            def _scsoff(base):
+                grp = base // fx.Int32(64)
+                return rocdl.readfirstlane(T.i32, (grp * fx.Int32(K128) + fx.Int32(2)) * fx.Int32(256))
+            sc_soff0 = [_scsoff(_scg[g]) for g in range_constexpr(4)]
+            sc_voff = lane_id * fx.Int32(4)
+            acc = mfma.call_mxfp4_wholeloop_wide(
+                a_base, b_base, a_s2r.tile_stride, b_s2r.tile_stride,
+                abase, bbase, gl_a6, gl_b6, rsrc_a, rsrc_b,
+                fx.Int32(KSTEP), acc, N_SUB, N_LDS_STEPS_A, N_LDS_STEPS_B, fx.Int32(KI),
+                soff0_a, soff0_b, sc_rb, sc_gb, sa_s2r.rsrc, sb_s2r.rsrc, sc_voff, sc_soff0)
+            base_row = block_m * BLOCK_M
+            base_col = block_n * BLOCK_N + wave_id * WAVE_N
+            store_c.store(acc, base_row, base_col)
+            return
+        a_g2s.load(A_buf[0], A_off + 0 * KSTEP)
+        b_g2s.load(B_buf[0], B_off + 0 * KSTEP)
+        wait_barrier(0)
+        for k in range_constexpr(KI):
+            cur = k % NBUF
+            nxt = (k + 1) % NBUF
+            sa = [[sa_s2r.load(sa_base + fx.Int32(64 * g), N_SUB * k + s) for g in range_constexpr(G_A)]
+                  for s in range_constexpr(N_SUB)]
+            sb = [[sb_s2r.load(sb_base + fx.Int32(64 * g), N_SUB * k + s) for g in range_constexpr(G_B)]
+                  for s in range_constexpr(N_SUB)]
+            a_frag = a_s2r.load(A_buf[cur])
+            b_frag = b_s2r.load(B_buf[cur])
+            if const_expr(k + 1 < KI):
+                b_g2s.load(B_buf[nxt], B_off + (k + 1) * KSTEP)
+                a_g2s.load(A_buf[nxt], A_off + (k + 1) * KSTEP)
+            rocdl.s_setprio(1)
+            if const_expr(_NOASM):
+                acc = _mfma_wide(a_frag, b_frag, acc, sa, sb)
+            else:
+                acc = mfma.call_packed_asm_wide(a_frag, b_frag, acc, sa, sb, N_SUB)
+            rocdl.s_setprio(0)
+            if const_expr(_LEAN < 2):
+                wait_barrier(0)
+
+        base_row = block_m * BLOCK_M
+        base_col = block_n * BLOCK_N + wave_id * WAVE_N
+        store_c.store(acc, base_row, base_col)
+
+    _pt = {"passthrough": [["amdgpu-agpr-alloc", "256"]]} if agpr else {}
+
+    @flyc.jit
+    def launch_gemm(
+        A: fx.Tensor,
+        B_T: fx.Tensor,
+        C: fx.Tensor,
+        A_scale: fx.Tensor,
+        B_scale: fx.Tensor,
+        c_m: fx.Int32,
+        c_n: fx.Int32,
+        stream: fx.Stream,
+    ):
+        grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        kernel_gemm_wide(
+            A, B_T, C, A_scale, B_scale, c_m, c_n,
+            value_attrs={"rocdl.flat_work_group_size": "256,256",
+                         "rocdl.waves_per_eu": const_expr(1), **_pt},
+        ).launch(grid=(grid_x, 1, 1), block=(256, 1, 1), stream=stream)
+
+    if maxnreg:
+        launch_gemm.compile_hints = {**getattr(launch_gemm, "compile_hints", {}), "maxnreg": maxnreg}
+    return launch_gemm
+
+
 # Production 4-wave config: bare-asm whole-loop INPLACE-DIAG + SCVGPR (scales direct to VGPR,
 # no LDS ds_read) with FP4_INPLACE_1BAR=0 (per-phase s_barrier — the cross-wave LDS sync that
 # makes SCVGPR det0; with 1BAR=1 the shortened stream races). = ~5350 TF det0 vs 5198 INPLACE-only.
