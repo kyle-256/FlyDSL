@@ -1089,7 +1089,7 @@ class MfmaScaleFp4:
                         r.append(f"ds_read_b32 ${t_sc + slot+off}, ${i_scrb[buf]} offset:{slot*256}")
                 return r
 
-            _MMORD = int(__import__("os").environ.get("FP4_MMORD", "5"))  # mfma emission order (bank-conflict probe)
+            _MMORD = int(__import__("os").environ.get("FP4_MMORD", "9"))  # mfma emission order (bank-conflict probe)
             def emit_mm(off=0):
                 r = []
                 def one(sl, tb, sbfn, s, ii, ji):
@@ -1387,13 +1387,15 @@ class MfmaScaleFp4:
                 # BOTH A[ii] and B[col] free progressively (each refilled mid-loop). side="A"/"B":
                 # one side progressive (other end-drained). Accs order-independent -> reorder safe.
                 cells = []   # (ii, sl, ji)
-                _mmo = int(__import__("os").environ.get("FP4_MMORD", "5"))
-                _mm3 = _mmo in (3, 4, 5)
+                _mmo = int(__import__("os").environ.get("FP4_MMORD", "9"))
+                _mm3 = _mmo in (3, 4, 5, 6, 7, 8, 9, 10)
                 if side == "DIAG" and _mm3:
                     # BLOCKED DIAGONAL: both-progressive free (DIAG hide) + N-chain throughput +
                     # wider-bn restores A-operand reuse (raises DIAG-削 ceiling toward natural 7555).
                     # block (bm A-rows x bn cols): MMORD 3=2x2, 4=4x2 (deeper A-reuse), 5=2x4 (wider).
-                    bm, bn = {3: (2, 2), 4: (4, 2), 5: (2, 4)}[_mmo]
+                    bm, bn = {3: (2, 2), 4: (4, 2), 5: (2, 4),
+                              6: (4, 4), 7: (2, 8), 8: (8, 4),
+                              9: (4, 8), 10: (8, 8)}[_mmo]
                     ncol = 2 * ntb; nib = nta // bm; ncb = ncol // bn
                     # FP4_SINNER: put s (K-sub) INNERMOST so the same acc's n_sub MFMA are
                     # consecutive (gluon/amdgcnas pattern: acc stays in the MFMA PE, full-rate
@@ -1446,7 +1448,7 @@ class MfmaScaleFp4:
                                 col = d - ii
                                 if 0 <= col < ncol:
                                     cells.append((ii, col // ntb, col % ntb, s))
-                elif int(__import__("os").environ.get("FP4_MMORD", "5")) == 3:
+                elif int(__import__("os").environ.get("FP4_MMORD", "9")) == 3:
                     # aiter 2x2 register-block (throughput) + A-progressive (side A hides A): block ii,ji
                     for sl in (0, 1):
                         for s in range(n_sub):
@@ -1711,7 +1713,7 @@ class MfmaScaleFp4:
                 def ss_bl(ss, ji): return NT + ss * sub_sz + nta + ji
                 def ss_br(ss, ji): return NT + ss * sub_sz + nta + ntb + ji
                 def ss_sc(ss, g): return NT + ss * sub_sz + nfs + g   # g: 0=A-g0,1=A-g1,2=BL,3=BR
-                _ssmm3 = int(__import__("os").environ.get("FP4_MMORD", "5")) == 3
+                _ssmm3 = int(__import__("os").environ.get("FP4_MMORD", "9")) == 3
                 def emit_mm_ss(ss):
                     r = []
                     def _emit(sl, bget, scg, ii, ji):
