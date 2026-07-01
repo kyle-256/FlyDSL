@@ -419,13 +419,23 @@ def compile_mxfp4_gemm_4w(
                 _sob = rocdl.readfirstlane(T.i32, _wib * fx.Int32(K128) * fx.Int32(512))
                 sc_soff06 = [_soa, sc_soff06[1], _sob, sc_soff06[3]]
                 sc_voff6 = lane_id * fx.Int32(8 * N_SUB)   # 2*N_SUB dwords/lane * 4B (was hardcoded 16 for N_SUB=2)
+            # odd-KI (K % 512 == 256) tail: the unroll-2 whole-loop runs KI//2 pairs over
+            # a floor-even nval, then call_mxfp4_wholeloop emits one MFMA-only phase-A tail
+            # for the trailing 256-K block (ki -> tail gate). Even KI: nval==KI, no tail.
+            # KI==1 (K=256) keeps the legacy single-block path (ki=None).
+            if const_expr(KI >= 2):
+                _nval_even = const_expr(KI - (KI & 1))
+                _ki_tail = KI
+            else:
+                _nval_even = KI
+                _ki_tail = None
             accL, accR = mfma.call_mxfp4_wholeloop(
                 a_base6, bl_base6, br_base6, a_s2r.tile_stride, b_s2r.tile_stride,
                 abase6, blbase6, brbase6, gl_a6, gl_b6, rsrc_a, rsrc_b,
                 fx.Int32(KSTEP), scv6, accL, accR, N_SUB, N_LDS_STEPS_A, N_LDS_STEPS_BH,
-                fx.Int32(KI), soff6_a, soff6_bl, soff6_br,
+                fx.Int32(_nval_even), soff6_a, soff6_bl, soff6_br,
                 sc_rb6, sc_gb6, _scrsa_v, _scrsb_v, sc_voff6, sc_soff06,
-                sca_rb6, sca_gb6, sca_voff6)
+                sca_rb6, sca_gb6, sca_voff6, ki=_ki_tail)
 
         # FP4_LEANBAR: speed-ceiling probe. 2 = strip ALL sync (s_barrier + vmcnt drain,
         # correctness ignored) -> measures the no-sync ceiling; 1 = drop only end s_barrier.

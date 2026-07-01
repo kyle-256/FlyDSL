@@ -3,15 +3,33 @@
 
 """MXFP4 dense GEMM (per-1x32 E8M0 block-scaled E2M1 fp4) for AMD CDNA4 (gfx950).
 
-Correctness-first v0: A/B fp4 fragments loaded DIRECTLY gmem->reg per MFMA (no
-LDS staging / no software pipeline) to validate the fp4 MFMA + scale path. Once
-correct, an LDS-staged + pipelined version follows for perf.
+This is the MERGED production file. It carries two things:
+
+  1. The production 8-wave kernel ``compile_mxfp4_gemm_8w`` -- a clean,
+     mxfp8-mirrored, double-buffered (cur/next) LDS pipeline with 2x2 quadrant
+     accumulators and an interleaved s_barrier/s_setprio schedule. It folds in the
+     two winning levers from the parallel tuning sweep:
+       * packed-scale + opsel + combine_a (default ``packed=True, combine_a=True``)
+         -- one opsel-indexed i32 per region instead of a broadcast dwordx{n_tiles}
+         (~4x less scale VMEM), the dominant lever (~+18.8% on long K). Set
+         ``packed=False`` for the clean broadcast fallback (before/after compare).
+       * scale prefetch / cross-barrier distribution (env ``FP4_PF``, 1-deep) --
+         orthogonal, stacks on packed; spreads the scale VMEM loads across the
+         barrier sections to overlap MFMA latency. ``swizzle`` defaults on.
+
+  2. The legacy fp4 helper symbols (heavy bare-asm ``MfmaScaleFp4``, the padded
+     ``S2RLoaderFp4``, ``ScaleS2RPacked`` / ``ScaleS2RPackedA2`` / ``ScaleBComb-
+     Packed``, ``grouped_xcd_pid``, ``preshuffle_scale_packed`` /
+     ``preshuffle_scale_packed_a2`` / ``preshuffle_scale_b_comb_packed`` /
+     ``preshuffle_scale_lane_contig``, ...) that the prod 4-wave kernel
+     (``turbo/mxfp4_gemm_4wave.py``) imports from here. These are supersets of the
+     light classes the 8-wave kernel needs, so both kernels share one definition.
 
 fp4 layout: packed 2/byte (byte b = K[2b] low nibble | K[2b+1] high nibble).
 A 16x16x128 mfma_scale (cbsz=4/blgp=4) contracts 128 fp4 = 4 micro-blocks of 32;
 lane (g=lane//16, r=lane%16) provides row/col r, block g = 32 fp4 = 16 contiguous
 bytes [k*64 + g*16 ..]. Operand is i32x8 with low 16B real + upper 16B zero.
-Scale path is IDENTICAL to mxfp8 (per-1x32 E8M0, 4 blocks/mfma) -- reused.
+Scale granularity is IDENTICAL to mxfp8 (per-1x32 E8M0, 4 blocks/mfma).
 """
 
 import flydsl.compiler as flyc
@@ -52,21 +70,19 @@ def _packed_eligible(mode, BLOCK_N):
 
 
 def preshuffle_mxfp4_scales(a_e8m0, b_e8m0, K, BLOCK_M=256, BLOCK_N=256,
-                            mode="pipe", combine_a=False):
-    """Host scale prep matching the kernel's chosen layout: PACKED (opsel) for the
-    eligible production pipe path, else broadcast-dwordx4. combine_a packs both
-    M-regions' A scale into one coalesced dwordx2 (default). Returns
-    (a_scale_i32, b_scale_i32) -- keeps host & kernel in lockstep."""
+                            packed=True, combine_a=True, **_ignored):
+    """Repack raw E8M0 [DIM, K//32] into the layout the production kernel's scale
+    loaders consume. Default (matching ``compile_mxfp4_gemm_8w`` defaults): PACKED
+    A (combine_a -> coalesced dwordx2) + PACKED combined-B. Set ``packed=False``
+    for the clean broadcast baseline. Must stay in lockstep with
+    ``compile_mxfp4_gemm_8w(packed=, combine_a=)``. Returns (a_scale_i32, b_scale_i32)."""
+    assert BLOCK_M % 64 == 0 and BLOCK_N % 256 == 0
     n_tiles_a = BLOCK_M // 64
-    if _packed_eligible(mode, BLOCK_N):
-        a_pk = (preshuffle_scale_packed_a2(a_e8m0, K, n_tiles_a)
-                if (combine_a and BLOCK_M == 256 and mode != "wholeloop")
+    if packed:
+        a_pk = (preshuffle_scale_packed_a2_8w(a_e8m0, K, n_tiles_a) if combine_a
                 else preshuffle_scale_packed(a_e8m0, K, n_tiles_a))
         return a_pk, preshuffle_scale_b_comb_packed(b_e8m0, K)
-    a_bc = preshuffle_scale(a_e8m0, K, n_tiles_a)
-    if BLOCK_N >= 256:  # combined-B (B_COMB)
-        return a_bc, preshuffle_scale_b_comb(b_e8m0, K)
-    return a_bc, preshuffle_scale(b_e8m0, K, BLOCK_N // 128)  # BN128: per-region B (ScaleBRegion)
+    return preshuffle_scale(a_e8m0, K, n_tiles_a), preshuffle_scale_b_comb(b_e8m0, K)
 
 
 def preshuffle_scale_lane_contig(e8m0_u8, K, n_tiles, n_sub, mode):
@@ -177,6 +193,33 @@ def preshuffle_scale_packed_a2(e8m0_u8, K, n_tiles):
     return out.contiguous()
 
 
+def preshuffle_scale_packed_a2_8w(e8m0_u8, K, n_tiles):
+    """combine_a PACKED layout for the 8-WAVE kernel (region geometry differs from
+    the 4-wave ``preshuffle_scale_packed_a2`` above). The 8-wave wave covers two
+    M-regions that are groups (g0, g0+2): region1 sits +LDS_BLOCK_M=+128 rows = +2
+    groups (group_span = 16*n_tiles = 64 rows). The 4 groups of one block_m pair as
+    (0,2),(1,3); wi = block_m*2 + wave_m indexes the pair.
+
+    Output int32 [n_wi, K//128, 64, 2], last dim {region0=g0, region1=g0+2}.
+    Coalesced (lane-consecutive) -> cuts the 2 A-scale loads/128-K to 1. Pairs with
+    ``ScaleS2RPackedA2_8w``."""
+    import torch
+
+    p = preshuffle_scale_packed(e8m0_u8, K, n_tiles)   # [G, K128, 64]
+    G, K128, _ = p.shape
+    assert G % 4 == 0, f"8-wave combine_a needs group count multiple of 4, got G={G}"
+    n_blk = G // 4
+    n_wi = n_blk * 2
+    out = torch.empty((n_wi, K128, 64, 2), dtype=torch.int32, device=p.device)
+    for blk in range(n_blk):
+        for wm in range(2):
+            wi = blk * 2 + wm
+            g0 = blk * 4 + wm
+            out[wi, :, :, 0] = p[g0]
+            out[wi, :, :, 1] = p[g0 + 2]
+    return out.contiguous()
+
+
 class ScaleS2RPackedA2:
     """Combine-A loader: ONE coalesced dwordx2 returns both M-regions' packed scale
     [region0_dword, region1_dword] for a (wi, k, lane). Pairs with
@@ -192,6 +235,28 @@ class ScaleS2RPackedA2:
 
     def load(self, base0, k):
         wi = base0 // 128                                # g0//2, g0 = base0//64 (even)
+        idx = ((wi * self.K128 + k) * 64 + self.lane) * 2
+        v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=2, dtype=T.i32))
+        return [_raw(v[0]), _raw(v[1])]
+
+
+class ScaleS2RPackedA2_8w:
+    """8-wave combine_a loader: ONE coalesced dwordx2 returns both M-regions' packed
+    scale [region0=g0, region1=g0+2] for a (wi, 128-K, lane). Pairs with
+    ``preshuffle_scale_packed_a2_8w``. ``base0`` is the region0 base; wi derived as
+    block_m*2 + wave_m (region geometry: groups g0, g0+2)."""
+
+    def __init__(self, sp_tensor, dim, K, n_tiles):
+        self.K128 = K // 128
+        self.group_span = 16 * n_tiles
+        self.lane = fx.thread_idx.x % 64
+        n_wi = (dim // self.group_span) // 2
+        nbytes = n_wi * self.K128 * 64 * 2 * 4
+        self.rsrc = buffer_ops.create_buffer_resource(sp_tensor, max_size=False, num_records_bytes=nbytes)
+
+    def load(self, base0, k):
+        grp0 = base0 // self.group_span         # block_m*4 + wave_m
+        wi = (grp0 // 4) * 2 + (grp0 % 2)        # block_m*2 + wave_m
         idx = ((wi * self.K128 + k) * 64 + self.lane) * 2
         v = Vec(buffer_ops.buffer_load(self.rsrc, idx, vec_width=2, dtype=T.i32))
         return [_raw(v[0]), _raw(v[1])]
@@ -799,7 +864,7 @@ class MfmaScaleFp4:
     def call_mxfp4_wholeloop(self, a_base, bl_base, br_base, ts_a, ts_b,
                              abase, blbase, brbase, gl_a, gl_b, rsrc_a, rsrc_b,
                              kstep, scv, cL, cR, n_sub, nsa, nsb, nval, soff0, soff0_bl, soff0_br,
-                             sc_rb, sc_gb, sc_rsa, sc_rsb, sc_voff, sc_soff0, sca_rb=None, sca_gb=None, sca_voff=None, _cache={}):
+                             sc_rb, sc_gb, sc_rsa, sc_rsb, sc_voff, sc_soff0, sca_rb=None, sca_gb=None, sca_voff=None, ki=None, _cache={}):
         """WHOLE-LOOP bare-asm (aiter structure, perf-validated _asm9 ~5722): the ENTIRE
         K-loop is ONE inline-asm hw-loop -> no per-iter FlyDSL boundary / operand passing
         (the +16% lever, NOT double-buffer). 2 LDS buffers (buf0/buf1) ping-pong, unroll-2
@@ -836,7 +901,8 @@ class MfmaScaleFp4:
         _SCV2AHEAD = int(__import__("os").environ.get("FP4_SCV_2AHEAD", "0"))  # 2-ahead scale prefetch: load own set AFTER mfma (next-iter same phase) -> 2 vmcnt barriers (VMEM out-of-order drain @ WLV>0).
         _SCDWX4 = int(__import__("os").environ.get("FP4_SCDWX4", "0"))  # scale preshuffle(lane-contig) -> 2 buffer_load_dwordx4...lds (A,B packed regions) replace 8 dword g2s; ds_read_b32 back. LDS/lgkmcnt (det-safe). aiter g2s 8 vs FlyDSL 16 dword/256mfma.
         NSET = 2 if (_WLDB and not _SUB) else 1
-        key = (nta, ntb, n_sub, nsa, nsb, ts_a, ts_b, nbuf, _WLDB, _RING, _BPREF, _SS, _SCA2, _TRB8, _SCVGPR, _SCV2AHEAD, _SCDWX4,
+        _oddtail = 1 if (ki is not None and (ki & 1)) else 0   # odd-KI MFMA-only phase-A tail
+        key = (nta, ntb, n_sub, nsa, nsb, ts_a, ts_b, nbuf, _WLDB, _RING, _BPREF, _SS, _SCA2, _TRB8, _SCVGPR, _SCV2AHEAD, _SCDWX4, _oddtail,
                int(__import__("os").environ.get("FP4_SUBSTREAM_VM", "10")),
                int(__import__("os").environ.get("FP4_SS_UNROLL", "0")),
                int(__import__("os").environ.get("FP4_PIN", "0")),
@@ -2140,6 +2206,19 @@ class MfmaScaleFp4:
             L.append(f"s_cmp_lt_u32 ${o_cnt}, ${i_nval}")
             L.append("s_cbranch_scc1 1b")
 
+            # ── odd-KI trailing phase-A (MFMA-only) tail ──────────────────────────
+            # Caller passes nval = floor-even (KI-(KI&1)); the unroll-2 do-while runs
+            # KI//2 full pairs (accumulating k0..KI-2). For odd KI the last phase-B's
+            # emit_inplace(0) + emit_sc_vgpr(0) have ALREADY refilled the operand set
+            # (t_a/t_bl/t_br, off 0) and base-0 scales with k=KI-1, so we just drain and
+            # run one more 128-MFMA phase-A to fold in the trailing 256-K block. Only the
+            # production INPLACE + SCVGPR (NSET=1) path is supported; other experimental
+            # sub-modes keep requiring even KI. Matches the production wrapper's tail.
+            if _INPLACE and _SCVGPR and not _SCV2AHEAD and (ki is not None) and (ki & 1):
+                L.append("s_waitcnt vmcnt(0) lgkmcnt(0)")
+                _scb[0] = 0
+                L += emit_mm()
+
             # FP4_PIN: pin operand+scale temps to contiguous physical VGPRs. Bypasses the LLVM RA
             # "Cannot decrease cascade number, illegal eviction" crash that NSET=2 (WLDB/RING)
             # triggers -> enables register double-buffer / ring on production (proven on bareasm).
@@ -2998,6 +3077,42 @@ def recommend_config(M, N, K):
     return block_m, block_n, group_m, group_n, num_xcds, block_k, swizzle
 
 
+def recommend_group_n(M, N, K, group_m=4, BLOCK_M=256, BLOCK_N=256):
+    """Pick group_n for the 2D N-band tiling from the GEMM shape (variant C lever).
+
+    Mechanism (measured on gfx950 MI355X, fp4 BLOCK=256): the 1D GROUP_M schedule
+    already reuses A across the *entire* N sweep, but streams the whole N slab of
+    B per group, so B (N x K) never fits L2 and is re-fetched from HBM every M-row.
+    A width-``group_n`` N-band caps the resident B working set to group_n columns
+    (reused group_m times) at the cost of bounding A-reuse to group_n. This is a
+    net win only when B-streaming dominates -- i.e. N is much larger than M and K
+    is short enough that one band's (group_m+group_n) slabs fit L2. At K>=4096 the
+    per-tile compute already amortizes HBM traffic and the reorder only worsens
+    XCD load balance, so group_n is neutral-to-harmful. ORCHESTRATOR-MEASURED
+    (M4096 N28672, median, the clean kernel -- NOT the overstated variant-C claim):
+
+      * K<=2048, N>=2*M  ->  group_n 8..16: +3..4% vs gn0 (modest, B-stream win)
+      * K==4096          ->  ~ -3.6% (gn16 < gn0): DO NOT engage
+      * K>=4096 or N~=M  ->  group_n 0 (neutral-to-harmful)
+
+    Returns an int group_n (0 disables the 2D band -> 1D GROUP_M baseline). Callers
+    pass it as compile_mxfp4_gemm_8w(group_n=recommend_group_n(M, N, K))."""
+    num_pid_m = ceildiv(M, BLOCK_M)
+    num_pid_n = ceildiv(N, BLOCK_N)
+    # Engage only at very short K (<=2048) with N-heavy B-streaming; K>=4096 measured
+    # neutral-to-harmful (tightened from variant-C's loose K<=12288 after orchestrator
+    # re-measurement: M4096 N28672 K4096 gn16 was -3.6%).
+    if K > 2048 or num_pid_n < 2 * num_pid_m:
+        return 0
+    # Size the band so one super-block's A+B slabs (~(group_m+group_n) tiles, each
+    # BLOCK*K/2 packed bytes) stay within an ~20MB L2 residency budget.
+    l2_budget_bytes = 20_000_000
+    slab_bytes = BLOCK_N * (K // 2)
+    band_tiles = max(1, l2_budget_bytes // slab_bytes)  # ~= group_m + group_n
+    gn = max(4, band_tiles - group_m)
+    return min(gn, 16, num_pid_n)
+
+
 def grouped_xcd_pid(pid, c_m, c_n, BLOCK_M, BLOCK_N, group_m=4, num_xcds=8, group_n=0):
     """Map block_idx -> (block_m, block_n) with XCD-aware remap + GROUP_M tiling
     for L2 locality (mirrors the gfx950 a4w4 reference). Pure index math, no data
@@ -3195,149 +3310,105 @@ class ScaleBRegion:
         return self.load(base, k), self.load(base + lds_block_n, k)
 
 
+# ── merged production kernel factory (variant B packed-scale + variant A sched) ─
+
+
 def compile_mxfp4_gemm_8w(
     *,
     K: int,
     BLOCK_M: int = 256,
     BLOCK_N: int = 256,
-    mode: str = "pipe",
-    block_k: int = 128,
+    block_k: int = 256,
     group_m: int = 4,
     num_xcds: int = 8,
     group_n: int = 0,
-    swizzle: bool = False,
-    interleave: bool = False,
-    preshuffle_b: bool = False,
-    b_vgpr: bool = False,
-    asm_mma: bool = False,
-    asm_iter: bool = False,
+    swizzle: bool = True,
+    packed: bool = True,
+    combine_a: bool = True,
+    **_ignored,  # accept (and ignore) legacy knobs: mode / nw_n / asm_* / etc.
 ):
-    # block_k: logical fp4 contracted per K-iter. The 16x16x128 MFMA always does
-    # 128 K, so a K-iter spans N_SUB == block_k/128 sub-block MFMAs per accumulator.
-    BLOCK_K = block_k
-    # FP4_STAGE3: gluon-style 3-stage / 1-barrier-per-iter K-loop with 3-deep LDS ring.
-    # k+2 G2S targets a 3rd buffer (free, last read at k-1) -> removes the WAR that forced
-    # the 2-stage's 7 s_barriers; keep 1 cross-wave wait_barrier/iter + sched cadence ->
-    # LLIR scheduler buries ds_read in the MFMA shadow (the gluon 4274->5253 lever).
-    # Needs BLOCK_K==128 (3-deep BK256=192KB>160KB LDS; BK128=96KB fits).
-    stage3 = int(__import__("os").environ.get("FP4_STAGE3", "0")) == 1
-    if stage3:
-        assert mode == "pipe" and BLOCK_M == 256 and BLOCK_N == 256 \
-            and not (asm_mma or asm_iter or interleave or b_vgpr or swizzle or preshuffle_b), \
-            "FP4_STAGE3 needs pipe/BM256/BN256, no asm/interleave/bvgpr/swizzle/preshuffle_b"
-    # B6: BLOCK_M=192 (small-M occupancy for grid-underfilled kv) needs only
-    # BLOCK_M % 64 == 0 (N_TILES_A = BLOCK_M//64 integral) + (BLOCK_M//2) % 16 == 0
-    # (LDS region a 16-row-wave granular). BM192 -> N_TILES_A=3, LDS_BLOCK_M=96.
-    assert BLOCK_M >= 128 and BLOCK_M % 64 == 0 and (BLOCK_M // 2) % 16 == 0
-    assert BLOCK_N >= 128 and BLOCK_N % 128 == 0
-    assert BLOCK_K % 128 == 0 and K % BLOCK_K == 0
+    """Merged production 8-wave MXFP4 GEMM.
 
-    K_ITERS = K // BLOCK_K
-    KI = K_ITERS
-    # Packed E8M0 + opsel (4x less scale VMEM) is the default; auto-disabled for
-    # configs that can't express it (kv BN128 -> broadcast-dwordx4 path). Host must
-    # match via _packed_eligible() / preshuffle_mxfp4_scales().
-    packed_scale = _packed_eligible(mode, BLOCK_N)
-    # combine-A: both M-regions' packed scale in one coalesced dwordx2 (2 loads/iter
-    # instead of 3). DISABLED: the A2 layout (ScaleS2RPackedA2/preshuffle_scale_packed_a2)
-    # is 4-wave geometry (consecutive groups, wave stride 128); on 8-wave (wave stride 64,
-    # region +2 groups) wave_m collapses -> 3/4 (wave_m,region) load wrong A-scale -> SNR~1.8.
-    # Per-region ScaleS2RPacked is correct for 8-wave (= 4-wave production path).
-    combine_a = False
-    N_SUB = BLOCK_K // 128  # 128-K MFMA sub-blocks per K-iter
-    BPR = BLOCK_K // 2  # packed-fp4 bytes per K-iter row in LDS
-    KSTEP = BPR  # gmem byte stride per K-iter
-    # LDS bank-swizzle kills the identity-layout ds_read bank conflict via the
-    # direct-DMA lane<->gmem permutation (see _swz_fwd); BM256/BN256 bulk only.
-    if swizzle:
-        assert mode in ("pipe", "wholeloop") and BLOCK_M == 256 and BLOCK_N == 256, \
-            "swizzle requires mode=pipe/wholeloop, BM256/BN256"
-    if interleave:
-        assert mode == "pipe" and BLOCK_M == 256 and BLOCK_N == 256, \
-            "interleave requires mode=pipe, BM256/BN256 (B_COMB, no A_NARROW)"
-    if preshuffle_b:
-        assert mode == "pipe" and BLOCK_N == 256, \
-            "preshuffle_b requires mode=pipe, BN256 (B_COMB); host must run preshuffle_b_mxfp4"
-    if b_vgpr:
-        assert mode == "pipe" and BLOCK_N == 256 and not interleave and not preshuffle_b, \
-            "b_vgpr requires mode=pipe, BN256, not interleave/preshuffle_b; host runs preshuffle_b_vgpr"
-    if asm_mma:
-        assert mode == "pipe" and BLOCK_N == 256 and not interleave, \
-            "asm_mma requires mode=pipe, BN256 (packed scale), not interleave"
-    if asm_iter:
-        assert mode == "pipe" and BLOCK_M == 256 and BLOCK_N == 256 and not interleave \
-            and not asm_mma, \
-            "asm_iter (monolithic AGPR cluster) requires pipe, BM256/BN256 (b_vgpr OK for overlap)"
-    # 2x4 wave topology: 2 M-waves x 4 N-waves. wave_m = wave_id//4, wave_n = wave_id%4.
-    NW_N = 4
-    N_TILES_A = BLOCK_M // 64
-    N_TILES_B = BLOCK_N // 128
+    Combines the two winning levers found by the parallel tuning sweep, on top of
+    the clean mxfp8-mirrored 8-wave base (double-buffered cur/next LDS, 2x2 quadrant
+    accumulators, interleaved s_barrier/s_setprio, N_SUB=2 fp4 sub-blocks):
+
+      * variant B (packed-scale + opsel + combine_a) -- the dominant lever
+        (+18.8% long K). ``packed=True`` packs a wave's per-tile E8M0 scales into
+        one i32 selected by MFMA opsel (~4x less scale VMEM); ``combine_a`` folds
+        both M-regions' A scale into one coalesced dwordx2. ``packed=False`` falls
+        back to the clean broadcast loaders for before/after comparison.
+
+      * variant A (scale prefetch / cross-barrier distribution) -- orthogonal,
+        stacks on B. env ``FP4_PF`` in {auto,full,a,b,none} 1-deep prefetches the
+        chosen scale operand and spreads the loads across the barrier sections so
+        their VMEM latency overlaps the prior section's MFMAs. Adapted to packed:
+        A's per-region i32 / combine_a's dwordx2 / B's (packed_i32, opsel) returns.
+        Default 'full' (prefetch BOTH A+B) -- measured best at every K on the packed
+        base (packed scales are ~4x smaller regs, so 'full' no longer spills).
+
+    swizzle defaults on (LDS bank-swizzle, G2S _swz_inv <-> S2R _swz_fwd). group_n
+    is passed through to grouped_xcd_pid (2D N-band L2; default 0 = 1D GROUP_M).
+    """
+    BLOCK_K = block_k
+    assert BLOCK_M == 256 and BLOCK_N == 256, "clean mxfp4 8w: BM256/BN256 only"
+    assert BLOCK_K == 256 and BLOCK_K % 128 == 0
+    assert K % BLOCK_K == 0
+
+    K_ITERS = K // BLOCK_K            # K-iters; each contracts BLOCK_K fp4
+
+    # Scale-prefetch mode (variant A lever). env FP4_PF in {auto,full,a,b,none}:
+    #   full -> 1-deep prefetch BOTH A and B scales (default)
+    #   a    -> prefetch only A 1-deep, B loaded in-iter (distributed)
+    #   b    -> prefetch only B 1-deep, A loaded in-iter (distributed)
+    #   none -> no cross-iter prefetch, just distribute in-iter loads
+    #   auto -> 'full' (kept as an alias so old callers keep working)
+    # Default chosen by measurement ON THE PACKED BASE (gfx950, BM/BN=256, swiz=1,
+    # serial median+min over K=512..28672): packed scales are ~4x smaller register
+    # footprint than broadcast, so 'full' (which spilled under broadcast in variant
+    # A) no longer spills and is the universal winner -- it leads min TF at EVERY K
+    # and median at K>=512 (vs 'b'/'none'); the long-K headline gains most (K28672
+    # ~+4% median / +4% min over 'b', ~+5.7% over 'none'). Keep the env override for
+    # experiments.
+    import os as _os
+    _PF = _os.environ.get("FP4_PF", "full").lower()
+    if _PF == "auto":
+        _PF = "full"
+    PF_A = _PF in ("full", "a")
+    PF_B = _PF in ("full", "b")
+    DO_COMBINE = bool(packed and combine_a)
+
+    N_SUB = BLOCK_K // 128            # 128-K MFMA sub-blocks per K-iter (=2)
+    BPR = BLOCK_K // 2               # packed-fp4 bytes per K-iter row in LDS (=128)
+    KSTEP = BPR                       # gmem byte stride per K-iter
+    K2 = K // 2                      # packed-fp4 gmem row stride (bytes)
+
+    N_TILES_A = BLOCK_M // 64         # 4
+    N_TILES_B = BLOCK_N // 128        # 2
     N_ACCUMS = N_TILES_A * N_TILES_B
+
     LDS_BLOCK_M = BLOCK_M // 2
     LDS_BLOCK_N = BLOCK_N // 2
+    N_LDS_STEPS_A = LDS_BLOCK_M // 64
+    N_LDS_STEPS_B = LDS_BLOCK_N // 64
+
+    a_lds_size = LDS_BLOCK_M * BPR
+    b_lds_size = LDS_BLOCK_N * BPR
     SA_TILES = N_TILES_A
-    SB_TILES = N_TILES_B
-    # Combined-B scale (ScaleBComb: one dwordx4 = 4 scales = 2 N-halves x N_TILES_B==2)
-    # is only valid for BLOCK_N==256. BLOCK_N==128 -> N_TILES_B==1: each of the two
-    # 64-wide N-halves (b0/b1) needs 1 scale -> use the generic per-region ScaleS2R
-    # (n_tiles=N_TILES_B) with host preshuffle_scale(b_sc, K, N_TILES_B). r_k1 wires
-    # this in the `direct` mode only; pipe/staged/il keep the BLOCK_N==256 path.
-    B_COMB = BLOCK_N >= 256
 
-    # G2S row coverage per step == n_waves * (64 / (BPR/16)) rows.
-    _ROWS_PER_STEP = 64 // (BPR // 16) * (512 // 64)  # lanes_per_row -> rows/step * n_waves
-    N_LDS_STEPS_A = LDS_BLOCK_M // _ROWS_PER_STEP
-    N_LDS_STEPS_B = LDS_BLOCK_N // _ROWS_PER_STEP
-    # Combined-128 B G2S for BLOCK_N<256 (BN128): each 64-wide N half-region is
-    # < _ROWS_PER_STEP(=128) so N_LDS_STEPS_B==0 (G2S empty). The two halves
-    # (b_lds0,b_lds1) are LDS-adjacent, so ONE G2S over the full BLOCK_N rows
-    # fills both (rows 0..63 -> b_lds0, 64..127 -> b_lds1, identity layout).
-    N_LDS_STEPS_B_FULL = BLOCK_N // _ROWS_PER_STEP
-    # BN < _ROWS_PER_STEP (e.g. BN64=64 < 128): the whole B tile is narrower than
-    # one cooperative G2S step, so N_LDS_STEPS_B_FULL==0 (B never loads). Fix:
-    # a partial-wave combined G2S -- only the first NW_B_ACTIVE waves (16 rows
-    # each) issue one step, filling b_lds0 + the LDS-adjacent b_lds1. Waves
-    # >= NW_B_ACTIVE are predicated out (no over-read past the B region, no LDS OOB).
-    B_NARROW = BLOCK_N < _ROWS_PER_STEP
-    NW_B_ACTIVE = BLOCK_N // 16  # 16 B rows per wave (lanes_per_row=4 -> 64/4)
-    # B6: A analog of the narrow-B clamp-wave G2S. BM192 -> LDS_BLOCK_M=96 < step
-    # (128) -> N_LDS_STEPS_A==0 (A G2S empty). Fix: clamp-wave combined G2S per
-    # 96-row A region (NW_A_ACTIVE=6 waves x 16 rows = 96; waves >= 6 redundantly
-    # reload the last 16-row region -> in-bounds, idempotent, det-safe). Mirror of
-    # the round-19/20 narrow-B fix, applied per-region (a_lds0, a_lds1) instead of
-    # the combined-adjacent B trick.
-    A_NARROW = LDS_BLOCK_M < _ROWS_PER_STEP
-    NW_A_ACTIVE = LDS_BLOCK_M // 16  # 16 A rows per wave
-    # Padded LDS: row stride > BPR shifts rows across banks (kills bank conflict).
-    # pad_bytes must be a multiple of 16 to keep ds_read_b128 16B-aligned.
-    LDS_ROW_STRIDE = BPR
-    a_lds_size = LDS_BLOCK_M * LDS_ROW_STRIDE  # packed bytes per region buffer
-    b_lds_size = LDS_BLOCK_N * LDS_ROW_STRIDE
-    K2 = K // 2  # packed-fp4 row stride in bytes
-
-    _WL = (mode == "wholeloop")  # 8-wave whole-loop bare-asm
-    _sc_anns = {
-        "A_lds_cur_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
-        "A_lds_cur_1": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
-        "A_lds_next_0": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
-        "A_lds_next_1": fx.Array[fx.Float8E4M3FN, a_lds_size, 16],
-        "B_lds_cur_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
-        "B_lds_cur_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
-        "B_lds_next_0": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
-        "B_lds_next_1": fx.Array[fx.Float8E4M3FN, b_lds_size, 16],
-    }
-    # stage3 uses the existing 2-deep cur/next buffers (read-upfront frees the slot for
-    # the k+2 g2s; no 3rd buffer -> fits BK256 LDS budget).
-    if _WL:
-        # scales-in-LDS: 2 ping-pong buffers, each = n_waves(8) x 3 groups (A-r0,A-r1,
-        # B-comb) x N_SUB subs x 64 lanes (1 dword). 8-wave n_waves=8 (else wave OOB).
-        _SCBUF_8 = 8 * 3 * (BLOCK_K // 128) * 64
-        _sc_anns["SC_lds0"] = fx.Array[fx.Int32, _SCBUF_8, 16]
-        _sc_anns["SC_lds1"] = fx.Array[fx.Int32, _SCBUF_8, 16]
-    SharedStorageFp4Pipe = fx.struct(type("SharedStorageFp4Pipe", (), {"__annotations__": _sc_anns}))
+    @fx.struct
+    class SharedStorage:
+        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
+        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
 
     @flyc.kernel(known_block_size=[512, 1, 1])
-    def kernel_gemm_pipe(
+    def kernel_gemm(
         A: fx.Tensor,
         B_T: fx.Tensor,
         C: fx.Tensor,
@@ -3346,12 +3417,9 @@ def compile_mxfp4_gemm_8w(
         c_m: fx.Int32,
         c_n: fx.Int32,
     ):
-        # fp4 software pipeline: mirror of mxfp8_gemm_8wave's double-buffered
-        # cur/next staging with interleaved s_barriers + s_setprio + 1-deep scale
-        # prefetch. Per K-iter contracts BLOCK_K fp4 == N_SUB 128-K MFMA sub-blocks.
         F8_IR_t = fx.Float8E4M3FN.ir_type
 
-        lds = fx.SharedAllocator().allocate(SharedStorageFp4Pipe).peek()
+        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_cur0 = lds.A_lds_cur_0
         a_cur1 = lds.A_lds_cur_1
         a_next0 = lds.A_lds_next_0
@@ -3360,87 +3428,43 @@ def compile_mxfp4_gemm_8w(
         b_cur1 = lds.B_lds_cur_1
         b_next0 = lds.B_lds_next_0
         b_next1 = lds.B_lds_next_1
-        if const_expr(stage3):
-            # 2-deep rings indexed by k%2; read-upfront frees slot k%2 for the k+2 g2s.
-            s3_ar0 = [a_cur0, a_next0]; s3_ar1 = [a_cur1, a_next1]
-            s3_br0 = [b_cur0, b_next0]; s3_br1 = [b_cur1, b_next1]
 
         lane_id = fx.thread_idx.x % 64
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 4
         wave_n = wave_id % 4
-        block_m, block_n = grouped_xcd_pid(fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N,
-                                           group_m=group_m, num_xcds=num_xcds, group_n=group_n)
+        block_m, block_n = grouped_xcd_pid(
+            fx.block_idx.x, c_m, c_n, BLOCK_M, BLOCK_N, group_m=group_m, num_xcds=num_xcds, group_n=group_n
+        )
 
-        A0_off = block_m * BLOCK_M * K2
+        A0_off = (block_m * BLOCK_M) * K2
         A1_off = (block_m * BLOCK_M + LDS_BLOCK_M) * K2
-        if const_expr(preshuffle_b):
-            _BSLAB = 8 * 1024 * N_LDS_STEPS_B  # contiguous (region,k) slab bytes in B_pre
-            B_KSTEP = _BSLAB
-            B0_off = (block_n * 2 + 0) * KI * _BSLAB
-            B1_off = (block_n * 2 + 1) * KI * _BSLAB
-        else:
-            B_KSTEP = KSTEP
-            B0_off = block_n * BLOCK_N * K2
-            B1_off = (block_n * BLOCK_N + LDS_BLOCK_N) * K2
+        B0_off = (block_n * BLOCK_N) * K2
+        B1_off = (block_n * BLOCK_N + LDS_BLOCK_N) * K2
 
         gA = make_fp8_buffer_tensor(A, F8_IR_t)
         gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
-        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, packed=packed_scale)
-        _cs = mfma.call_subs_asm if asm_mma else mfma.call_subs  # asm-cluster MFMA (opaque, manual-vmcnt-able) vs intrinsic
         gl_off_a = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_A, BPR, swizzle=swizzle)
-        gl_off_b = (fp4_g2s_contiguous_offsets(lane_id, wave_id, N_LDS_STEPS_B) if preshuffle_b
-                    else fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR, swizzle=swizzle))
-        gl_off_b_full = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B_FULL, BPR)
+        gl_off_b = fp4_g2s_offsets(lane_id, wave_id, K, N_LDS_STEPS_B, BPR, swizzle=swizzle)
+
+        mfma = MfmaScaleFp4(N_TILES_A, N_TILES_B, packed=packed)
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
-        # BN128: combined-128 B G2S (one 128-row G2S fills adjacent b0+b1 halves).
-        b_g2s_full = G2SLoader(b_div, gl_off_b_full, N_LDS_STEPS_B_FULL, F8_IR_t, wave_id)
-        # B6 BM192/BM128 (A_NARROW): clamp-wave narrow-A G2S. LDS_BLOCK_M < 128 step ->
-        # N_LDS_STEPS_A==0 (regular a_g2s loads nothing). Each LDS_BLOCK_M-row A region
-        # filled by one combined G2S step where the wave index is clamped to
-        # [0, NW_A_ACTIVE-1]; waves >= NW_A_ACTIVE redundantly reload the last 16-row
-        # region (same gmem src + LDS dst -> idempotent, in-bounds, det-safe).
-        if const_expr(A_NARROW):
-            _wid_a = fx.Int32(wave_id)
-            eff_wave_a = (_wid_a < fx.Int32(NW_A_ACTIVE)).select(_wid_a, fx.Int32(max(NW_A_ACTIVE - 1, 0)))
-            gl_off_a_narrow = fp4_g2s_offsets(lane_id, eff_wave_a, K, 1, BPR)
-            a_g2s_narrow = G2SLoader(a_div, gl_off_a_narrow, 1, F8_IR_t, eff_wave_a)
-        _asmf = asm_mma or asm_iter or _WL  # asm MFMA needs i32x4 (cbsz:4), not i32x8
-        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, LDS_ROW_STRIDE, pad=not _asmf, swizzle=swizzle)
-        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, LDS_ROW_STRIDE, pad=not _asmf, swizzle=swizzle)
-        # B->VGPR-direct: skip B's LDS round-trip (no buffer_load_lds, no b ds_read);
-        # bvg.load(region, k) buffer_loads each lane's MFMA b-operands straight from the
-        # host-preshuffled B (preshuffle_b_vgpr). b_g2s no-op'd; b_read picks the source.
-        if const_expr(b_vgpr):
-            bvg = BVgprLoader(B_T, block_n, KI, N_TILES_B, N_SUB, c_n * K2, pad=not (asm_mma or asm_iter))
-            _bnoop = lambda *a, **k: None
-            b_g2s.load = _bnoop
-            b_g2s_full.load = _bnoop
+        a_s2r = S2RLoaderFp4(wave_m, N_TILES_A, N_SUB, BPR, swizzle=swizzle)
+        b_s2r = S2RLoaderFp4(wave_n, N_TILES_B, N_SUB, BPR, swizzle=swizzle)
 
-        def b_read(region, kk, lds_buf):
-            return bvg.load(region, kk) if const_expr(b_vgpr) else b_s2r.load(lds_buf)
-        # A-scale num_records must cover the rows the kernel addresses =
-        # ceil(c_m/BLOCK_M)*BLOCK_M (the padded extent). ScaleS2R floors
-        # dim//group_span, so pass a group_span-ceil'd dim. For aligned M
-        # (16*SA_TILES | c_m, true for all BM256 production shapes) this == c_m
-        # (byte-identical); only BM192 (16*3=48 ∤ 4096) pads, covering the edge
-        # M-tile's scale group (else valid rows 4080-4095 clamp to scale 0 -> SNR 24).
-        _sa_q = 16 * SA_TILES
-        _sa_qd = ((c_m + _sa_q - 1) // _sa_q) * _sa_q
-        if const_expr(packed_scale):
-            # PACKED scale: n_tiles E8M0 in ONE i32 (byte t = tile t), opsel per-XDL
-            # (4x less scale VMEM vs broadcast). combine_a (python ternary, compile-time)
-            # = both M-regions' scale in one coalesced dwordx2 (2 loads/iter not 3).
-            sa_s2r = ScaleS2RPackedA2(A_scale, _sa_qd, K, SA_TILES) if (combine_a and not _WL) \
-                else ScaleS2RPacked(A_scale, _sa_qd, K, SA_TILES)
+        if const_expr(packed):
+            if const_expr(combine_a):
+                sa_s2r = ScaleS2RPackedA2_8w(A_scale, c_m, K, SA_TILES)
+            else:
+                sa_s2r = ScaleS2RPacked(A_scale, c_m, K, SA_TILES)
             sb_s2r = ScaleBCombPacked(B_scale, c_n, K)
         else:
-            sa_s2r = ScaleS2R(A_scale, _sa_qd, K, SA_TILES)
-            sb_s2r = ScaleBComb(B_scale, c_n, K) if B_COMB else ScaleBRegion(B_scale, c_n, K, N_TILES_B)
+            sa_s2r = ScaleS2R(A_scale, c_m, K, SA_TILES)
+            sb_s2r = ScaleBComb(B_scale, c_n, K)
         store_c = StoreCPlain(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
 
         wave_m_offset = wave_m * (N_TILES_A * 16)
@@ -3449,556 +3473,125 @@ def compile_mxfp4_gemm_8w(
         sa_base1 = sa_base0 + fx.Int32(LDS_BLOCK_M)
         sb_base0 = fx.Int32(block_n * BLOCK_N + wave_n_offset)
 
-        if const_expr(_WL):
-            # 8-WAVE WHOLE-LOOP bare-asm: entire K-loop = ONE inline-asm hw-loop. occ=2
-            # (2 waves/SIMD inherent to the 8-wave WG) hides ds_read latency -> no ring,
-            # read-all-upfront + 2-buf ping-pong (a_cur*=buf0, a_next*=buf1). REAL scale
-            # via scales-in-LDS (ds_read_b32). 4 quadrants (a0/a1 x b0/b1), 32 VGPR accs.
-            K128 = const_expr(K // 128)
-            SC_buf = [lds.SC_lds0, lds.SC_lds1]
-            _SCW = const_expr(3 * N_SUB * 64)
-            rsrc_a = buffer_ops.create_buffer_resource(A, max_size=False, num_records_bytes=c_m * K2)
-            rsrc_b = buffer_ops.create_buffer_resource(B_T, max_size=False, num_records_bytes=c_n * K2)
-            a_r0 = [a_cur0, a_next0]; a_r1 = [a_cur1, a_next1]
-            b_h0 = [b_cur0, b_next0]; b_h1 = [b_cur1, b_next1]
-            # prologue: operand buf0 (k=0) + buf1 (k=1) for all 4 regions
-            a_g2s.load(a_r0[0], A0_off + 0 * KSTEP)
-            a_g2s.load(a_r1[0], A1_off + 0 * KSTEP)
-            b_g2s.load(b_h0[0], B0_off + 0 * B_KSTEP)
-            b_g2s.load(b_h1[0], B1_off + 0 * B_KSTEP)
-            if const_expr(KI > 1):
-                a_g2s.load(a_r0[1], A0_off + 1 * KSTEP)
-                a_g2s.load(a_r1[1], A1_off + 1 * KSTEP)
-                b_g2s.load(b_h0[1], B0_off + 1 * B_KSTEP)
-                b_g2s.load(b_h1[1], B1_off + 1 * B_KSTEP)
+        # Per-iter scale loaders -> the lists MFMA.call_subs consumes. sub-block s ->
+        # k128 = 2*k + s. packed: sa entries are ONE i32 (opsel selects tile); sb
+        # entries are (packed_i32, opsel_base). broadcast: per-tile i32 lists.
+        def load_sa_region(base, k):
+            # region's per-sub i32 (packed) / per-tile-list (broadcast). Identical
+            # call shape for both because ScaleS2RPacked / ScaleS2R both index (base,k128).
+            return [sa_s2r.load(base, 2 * k + s) for s in range_constexpr(N_SUB)]
 
-            def _sc_store(buf, slot, val):
-                idx = fx.Int32(wave_id) * fx.Int32(_SCW) + fx.Int32(slot * 64) + lane_id
-                pp = fx.add_offset(SC_buf[buf].ptr, fx.make_int_tuple(idx))
-                primitive.ptr_store(val, pp)
-            for _bk in range_constexpr(2):
-                for s in range_constexpr(N_SUB):
-                    _k = N_SUB * _bk + s
-                    _sc_store(_bk, 0 * N_SUB + s, sa_s2r.load(sa_base0, _k))
-                    _sc_store(_bk, 1 * N_SUB + s, sa_s2r.load(sa_base1, _k))
-                    _sc_store(_bk, 2 * N_SUB + s, sb_s2r.load(sb_base0, _k))
-            # scale stores are ds_write (lgkmcnt); wait_barrier(0) only drains vmcnt.
-            _llvm.inline_asm(res=None, operands_=[], asm_string="s_waitcnt lgkmcnt(0)",
-                             constraints="", has_side_effects=True)
-            wait_barrier(0)
-
-            a0_b = [[a_s2r.base_addr(a_r0[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(2)]
-            a1_b = [[a_s2r.base_addr(a_r1[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(2)]
-            b0_b = [[b_s2r.base_addr(b_h0[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(2)]
-            b1_b = [[b_s2r.base_addr(b_h1[b], s) for s in range_constexpr(N_SUB)] for b in range_constexpr(2)]
-
-            def _gbase(buf):
-                v = fx.Int32(fx.ptrtoint(buf.ptr)) + fx.Int32(wave_id) * fx.Int32(1024)
-                return rocdl.readfirstlane(T.i32, v)
-            ag0 = [_gbase(a_r0[b]) for b in range_constexpr(2)]
-            ag1 = [_gbase(a_r1[b]) for b in range_constexpr(2)]
-            bg0 = [_gbase(b_h0[b]) for b in range_constexpr(2)]
-            bg1 = [_gbase(b_h1[b]) for b in range_constexpr(2)]
-            gl_a6 = [fx.Int32(gl_off_a[st]) for st in range_constexpr(N_LDS_STEPS_A)]
-            gl_b6 = [fx.Int32(gl_off_b[st]) for st in range_constexpr(N_LDS_STEPS_B)]
-            # refill-OTHER (default) is 1-ahead: first refilled k-iter = 1 (not 2). soffset
-            # init shifts +AH*KSTEP / scale +AH*N_SUB. refill-same (FP4_WLOTHER=0) = 2-ahead.
-            _WLO = int(__import__("os").environ.get("FP4_WLOTHER", "0"))
-            AH = const_expr(1 if _WLO else 2)
-            soff_a0 = rocdl.readfirstlane(T.i32, A0_off + fx.Int32(AH * KSTEP))
-            soff_a1 = rocdl.readfirstlane(T.i32, A1_off + fx.Int32(AH * KSTEP))
-            soff_b0 = rocdl.readfirstlane(T.i32, B0_off + fx.Int32(AH * B_KSTEP))
-            soff_b1 = rocdl.readfirstlane(T.i32, B1_off + fx.Int32(AH * B_KSTEP))
-            sc_rb6 = [fx.ptrtoint(fx.add_offset(SC_buf[b].ptr,
-                      fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW) + lane_id)))
-                      for b in range_constexpr(2)]
-            sc_gb6 = [rocdl.readfirstlane(T.i32, fx.Int32(fx.ptrtoint(fx.add_offset(SC_buf[b].ptr,
-                      fx.make_int_tuple(fx.Int32(wave_id) * fx.Int32(_SCW))))))
-                      for b in range_constexpr(2)]
-            sc_voff6 = lane_id * fx.Int32(4)
-            def _scsoff_a(base):
-                grp = base // fx.Int32(64)
-                return rocdl.readfirstlane(T.i32, (grp * fx.Int32(K128) + fx.Int32(AH * N_SUB)) * fx.Int32(256))
-            def _scsoff_b(base):
-                grp = (base // fx.Int32(256)) * fx.Int32(4) + (base % fx.Int32(256)) // fx.Int32(32)
-                return rocdl.readfirstlane(T.i32, (grp * fx.Int32(K128) + fx.Int32(AH * N_SUB)) * fx.Int32(256))
-            sc_soff06 = [_scsoff_a(sa_base0), _scsoff_a(sa_base1), _scsoff_b(sb_base0)]
-
-            accs_wl = [mfma.zero_value] * (4 * N_ACCUMS)
-            accs_wl = mfma.call_mxfp4_wholeloop_8w(
-                a0_b, a1_b, b0_b, b1_b, a_s2r.tile_stride, b_s2r.tile_stride,
-                ag0, ag1, bg0, bg1, gl_a6, gl_b6, rsrc_a, rsrc_b,
-                fx.Int32(KSTEP), accs_wl, N_SUB, N_LDS_STEPS_A, N_LDS_STEPS_B, fx.Int32(KI),
-                soff_a0, soff_a1, soff_b0, soff_b1,
-                sc_rb6, sc_gb6, sa_s2r.rsrc, sb_s2r.rsrc, sc_voff6, sc_soff06)
-            base_row = block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            store_c.store(accs_wl[0:N_ACCUMS], base_row + 0, base_col + 0)
-            store_c.store(accs_wl[N_ACCUMS:2*N_ACCUMS], base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(accs_wl[2*N_ACCUMS:3*N_ACCUMS], base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(accs_wl[3*N_ACCUMS:4*N_ACCUMS], base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
-            return
-
-        # A G2S dispatch: BM192/128 (A_NARROW) -> clamp-wave narrow loader; BM256 ->
-        # regular a_g2s (byte-identical). const_expr-gated so only one path is traced.
-        def a_load(dst, off):
-            if const_expr(A_NARROW):
-                a_g2s_narrow.load(dst, off)
-            else:
-                a_g2s.load(dst, off)
-
-        # Per-sub-block scale loaders (K128 index = N_SUB*kiter + s). _sb uses the
-        # branch-free `load_halves` so BLOCK_N=128 (per-region) and BLOCK_N=256
-        # (combined dwordx4) share one code path; BN256 packing is unchanged.
-        # combine-A cache: kiter -> [region0_dword, region1_dword] from the one
-        # coalesced dwordx2 load (reg0 issues+caches, reg1 reads).
-        _sa_a2_cache = {}
-
-        def _sa(base, kiter, reg=0):
-            if const_expr(combine_a):
-                # Per K-128 sub-block (N_SUB of them per K-iter): reg0 issues ONE
-                # coalesced dwordx2 (both M-regions) + caches by k128 index; reg1 reads
-                # the cache (reg0 always precedes reg1 for a given k128).
-                out = []
-                for s in range_constexpr(N_SUB):
-                    k128 = N_SUB * kiter + s
-                    if const_expr(reg == 0):
-                        if const_expr(k128 not in _sa_a2_cache):
-                            _sa_a2_cache[k128] = sa_s2r.load(base, k128)
-                        out.append(_sa_a2_cache[k128][0])
-                    else:
-                        out.append(_sa_a2_cache[k128][1])
-                return out
-            # packed: each sub-block returns ONE packed i32 (n_tiles E8M0 in 4 bytes).
-            return [sa_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
-
-        def _sb(base, kiter):
-            if const_expr(packed_scale):
-                # ONE packed i32/(k) holds b0 (bytes 0,1) + b1 (bytes 2,3); both
-                # N-halves share the dword, carrying the opsel base (0 vs 2) so the
-                # call sites stay unchanged (mfma.call_subs reads it when packed).
-                sp = [sb_s2r.load(base, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
-                return [(sp[s], 0) for s in range_constexpr(N_SUB)], [(sp[s], 2) for s in range_constexpr(N_SUB)]
-            pairs = [sb_s2r.load_halves(base, LDS_BLOCK_N, N_SUB * kiter + s) for s in range_constexpr(N_SUB)]
-            return [pairs[s][0] for s in range_constexpr(N_SUB)], [pairs[s][1] for s in range_constexpr(N_SUB)]
-
-        def _quad_il(a_frag, b_frag, c_frag, sa, sb, sides):
-            """4wave-style interleave: run one quadrant's N_SUB*N_TILES_A*N_TILES_B
-            call_one MFMAs and spread the `sides` closures (G2S load_one steps for the
-            k+2 prefetch) evenly into the MFMA stream so the buffer_loads co-issue with
-            the matrix unit (hides the G2S-setup MFMA bubble). No intra-quadrant barrier."""
-            nmf = N_SUB * N_TILES_A * N_TILES_B
-            nsd = len(sides)
-            inj = {((t * nmf) // nsd): sides[t] for t in range(nsd)} if nsd else {}
-            m = 0
+        def load_sa_both(k):
+            # combine_a: ONE coalesced dwordx2 returns [region0, region1] per sub.
+            sa0, sa1 = [], []
             for s in range_constexpr(N_SUB):
-                for i in range_constexpr(N_TILES_A):
-                    for j in range_constexpr(N_TILES_B):
-                        c_frag[mfma.idx(i, j)] = mfma.call_one(a_frag, b_frag, c_frag, sa, sb, i, j, s)
-                        if const_expr(m in inj):
-                            inj[m]()
-                        m += 1
-            return c_frag
+                r = sa_s2r.load(sa_base0, 2 * k + s)
+                sa0.append(r[0])
+                sa1.append(r[1])
+            return sa0, sa1
 
+        def load_sb_both(k):
+            sb0, sb1 = [], []
+            for s in range_constexpr(N_SUB):
+                if const_expr(packed):
+                    p = sb_s2r.load(sb_base0, 2 * k + s)
+                    sb0.append((p, 0))
+                    sb1.append((p, 2))
+                else:
+                    ball = sb_s2r.load(sb_base0, 2 * k + s)
+                    sb0.append(ball[0:2])
+                    sb1.append(ball[2:4])
+            return sb0, sb1
+
+        # 2x2 config of accumulators
         c00_frag = [mfma.zero_value] * N_ACCUMS
         c01_frag = [mfma.zero_value] * N_ACCUMS
         c10_frag = [mfma.zero_value] * N_ACCUMS
         c11_frag = [mfma.zero_value] * N_ACCUMS
-        accs = [mfma.zero_value] * (4 * N_ACCUMS)  # asm_iter: flat 32 AGPR accs (c00|c01|c10|c11)
-        # 3-stage A LDS ring (reuse the idle B LDS buffers as A's 3rd stage; B is in VGPR
-        # via bvg). aring[k%3] always holds A[k]. The A G2S(k+2) writes aring[(k+2)%3] -- a
-        # buffer last read at iter k-1 (long done) -> NO WAR with this iter's read -> issue
-        # it BEFORE the 64-MFMA cluster so the buffer_load_lds latency overlaps the cluster
-        # (the cur/next 24.5% version exposed A G2S after it). Defined unconditionally
-        # (plain Python list of already-allocated handles; const_expr-if scopes vars out).
-        _ASM_RING = asm_iter and b_vgpr
-        aring0 = [a_cur0, a_next0, b_cur0]
-        aring1 = [a_cur1, a_next1, b_cur1]
-        if const_expr(_ASM_RING):
-            a_load(aring0[0], A0_off + 0 * KSTEP)
-            a_load(aring1[0], A1_off + 0 * KSTEP)
-            a_load(aring0[1], A0_off + 1 * KSTEP)
-            a_load(aring1[1], A1_off + 1 * KSTEP)
-            sa0 = _sa(sa_base0, 0)
-            sa1 = _sa(sa_base1, 0, 1)
-            sb0, sb1 = _sb(sb_base0, 0)
-            wait_barrier(0)  # A0,A1 landed + cross-wave visible before loop reads
 
-        if const_expr(stage3):
-            # 3-stage prologue: G2S k=0 -> ring slot0, k=1 -> ring slot1 (2-iter-ahead).
-            a_load(s3_ar0[0], A0_off + 0 * KSTEP); a_load(s3_ar1[0], A1_off + 0 * KSTEP)
-            b_g2s.load(s3_br0[0], B0_off + 0 * B_KSTEP); b_g2s.load(s3_br1[0], B1_off + 0 * B_KSTEP)
-            a_load(s3_ar0[1], A0_off + 1 * KSTEP); a_load(s3_ar1[1], A1_off + 1 * KSTEP)
-            b_g2s.load(s3_br0[1], B0_off + 1 * B_KSTEP); b_g2s.load(s3_br1[1], B1_off + 1 * B_KSTEP)
-            wait_barrier(0)  # drain both iters' G2S + cross-wave s_barrier (slots 0,1 visible)
-            sa0 = _sa(sa_base0, 0); sa1 = _sa(sa_base1, 0, 1)
-            sb0, sb1 = _sb(sb_base0, 0)
+        b_g2s.load(b_cur0, B0_off + 0 * KSTEP)
+        a_g2s.load(a_cur0, A0_off + 0 * KSTEP)
+        b_g2s.load(b_cur1, B1_off + 0 * KSTEP)
+        a_g2s.load(a_cur1, A1_off + 0 * KSTEP)
 
-        if const_expr(not _ASM_RING and not stage3):
-            if const_expr(B_COMB):
-                b_g2s.load(b_cur0, B0_off + 0 * B_KSTEP)
+        if wave_m == 1:
+            rocdl.s_barrier()
+
+        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+
+        b_g2s.load(b_next0, B0_off + 1 * KSTEP)
+        a_g2s.load(a_next0, A0_off + 1 * KSTEP)
+        b_g2s.load(b_next1, B1_off + 1 * KSTEP)
+
+        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+
+        # 1-deep cross-iter scale prefetch (variant A). Pre-load k=0 here; prefetch
+        # k+1 inside the loop, distributed across the barrier sections so the scale
+        # VMEM loads overlap MFMA/ds_read and never fall inside the s_setprio(1)
+        # high-prio MFMA window. Adapted to packed: A is per-region i32 (or one
+        # dwordx2 under combine_a), B is (packed_i32, opsel).
+        if const_expr(PF_A):
+            if const_expr(DO_COMBINE):
+                sa0, sa1 = load_sa_both(0)
             else:
-                b_g2s_full.load(b_cur0, B0_off + 0 * B_KSTEP)  # 128-row combined -> b_cur0+b_cur1
-            a_load(a_cur0, A0_off + 0 * KSTEP)
-            if const_expr(B_COMB):
-                b_g2s.load(b_cur1, B1_off + 0 * B_KSTEP)
-            a_load(a_cur1, A1_off + 0 * KSTEP)
+                sa0 = load_sa_region(sa_base0, 0)
+                sa1 = load_sa_region(sa_base1, 0)
+        if const_expr(PF_B):
+            sb0, sb1 = load_sb_both(0)
 
-            if wave_m == 1:
-                rocdl.s_barrier()
-
-            if const_expr(B_COMB):
-                wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
-            else:
-                wait_barrier(0)  # BN128: conservative prologue drain (one-time, correctness-first)
-
-            if const_expr(B_COMB):
-                b_g2s.load(b_next0, B0_off + 1 * B_KSTEP)
-            else:
-                b_g2s_full.load(b_next0, B0_off + 1 * B_KSTEP)  # 128-row combined -> b_next0+b_next1
-            a_load(a_next0, A0_off + 1 * KSTEP)
-            if const_expr(B_COMB):
-                b_g2s.load(b_next1, B1_off + 1 * B_KSTEP)
-
-            if const_expr(B_COMB):
-                wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
-            else:
-                wait_barrier(0)  # BN128: conservative prologue drain
-
-            sa0 = _sa(sa_base0, 0)
-            sa1 = _sa(sa_base1, 0, 1)
-            sb0, sb1 = _sb(sb_base0, 0)
-
-        for k in range_constexpr(KI - 2):
-            if const_expr(stage3):
-                # ===== gluon-style 3-stage / 1-barrier body (BK128, 3-deep ring) =====
-                # entry invariant: ring slots k%3,(k+1)%3 filled+visible; sa*/sb*=scales[k].
-                # 2-buffer read-upfront: slot rk=k%2 holds tile k. Read it to registers,
-                # MFMA (consumes -> slot rk dead), ONE barrier (cross-wave: all done), then
-                # g2s k+2 reuses slot rk. tile k+1 lives in slot (k+1)%2 (untouched this iter).
-                rk = k % 2
-                ar0, ar1 = s3_ar0[rk], s3_ar1[rk]
-                br0, br1 = s3_br0[rk], s3_br1[rk]
-                sa0n = _sa(sa_base0, k + 1); sa1n = _sa(sa_base1, k + 1, 1)
-                sb0n, sb1n = _sb(sb_base0, k + 1)
-                a0_frag = a_s2r.load(ar0); a1_frag = a_s2r.load(ar1)
-                b0_frag = b_read(0, k, br0); b1_frag = b_read(1, k, br1)
-                rocdl.s_setprio(1)
-                c00_frag = _cs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
-                c01_frag = _cs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
-                c10_frag = _cs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
-                c11_frag = _cs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
-                rocdl.s_setprio(0)
-                if const_expr(int(__import__("os").environ.get("FP4_SCHED", "0"))):
-                    _nm = 4 * N_ACCUMS * N_SUB; _nd = 2 * (N_TILES_A + N_TILES_B) * N_SUB
-                    _b = _nm // _nd; _ex = _nm % _nd; _mi = 0
-                    for _j in range_constexpr(_nd):
-                        _g = _b + (1 if _j < _ex else 0)
-                        if const_expr(_g > 0):
-                            rocdl.sched_mfma(_g); _mi += _g
-                        rocdl.sched_dsrd(1)
-                    if const_expr(_mi < _nm):
-                        rocdl.sched_mfma(_nm - _mi)
-                rocdl.s_barrier()  # cross-wave: all waves done reading slot rk before g2s
-                a_load(ar0, A0_off + (k + 2) * KSTEP); a_load(ar1, A1_off + (k + 2) * KSTEP)
-                b_g2s.load(br0, B0_off + (k + 2) * B_KSTEP); b_g2s.load(br1, B1_off + (k + 2) * B_KSTEP)
-                wait_barrier(0)  # drain g2s vmcnt + cross-wave visibility for iter k+2 read
-                sa0, sa1 = sa0n, sa1n
-                sb0, sb1 = sb0n, sb1n
-                continue
-            if const_expr(_ASM_RING):
-                # 3-stage-ring overlap: A[k+2] G2S + B[k+1] VGPR-load issued BEFORE the
-                # 64-MFMA cluster so both buffer_load latencies hide under the MFMA. The
-                # single wait_barrier(0) after the cluster is then cheap (loads already
-                # in flight during the 64 MFMAs). aring[(k+2)%3] is WAR-free (last read
-                # at iter k-1, globally done via the prev iter's wait_barrier s_barrier).
-                sa0n = _sa(sa_base0, k + 1)
-                sb0n, sb1n = _sb(sb_base0, k + 1)
-                sa1n = _sa(sa_base1, k + 1, 1)
-                rd0, rd1 = aring0[k % 3], aring1[k % 3]
-                wr0, wr1 = aring0[(k + 2) % 3], aring1[(k + 2) % 3]
-                a0_frag = a_s2r.load(rd0)                         # ds_read A[k] (lgkmcnt; dep -> auto-wait at cluster)
-                a1_frag = a_s2r.load(rd1)
-                b0_frag = bvg.load(0, k)                          # B[k] -> VGPR single-buffer (JIT)
-                b1_frag = bvg.load(1, k)
-                a_load(wr0, A0_off + (k + 2) * KSTEP)             # A[k+2] -> fresh LDS (overlaps cluster)
-                a_load(wr1, A1_off + (k + 2) * KSTEP)
-                rocdl.s_setprio(1)
-                accs = mfma.call_iter_asm(a0_frag, a1_frag, b0_frag, b1_frag,
-                                          sa0, sa1, sb0, sb1, accs, N_SUB)
-                rocdl.s_setprio(0)
-                wait_barrier(0)  # drain A prefetch (overlapped cluster -> cheap) + s_barrier (vis/WAR)
-                sa0, sa1 = sa0n, sa1n
-                sb0, sb1 = sb0n, sb1n
-                continue
-            if const_expr(asm_iter):
-                # MONOLITHIC B-LDS path (b_vgpr off): ONE 64-MFMA asm cluster, 32 accs AGPR
-                # tied across iters, k+2 G2S prefetch (B stays LDS for reuse).
-                sa0n = _sa(sa_base0, k + 1)
-                sb0n, sb1n = _sb(sb_base0, k + 1)
-                sa1n = _sa(sa_base1, k + 1, 1)
-                wait_barrier(0)  # drain prev-iter prefetch BEFORE reads; +s_barrier sync
-                a0_frag = a_s2r.load(a_cur0)
-                a1_frag = a_s2r.load(a_cur1)
-                b0_frag = b_read(0, k, b_cur0)
-                b1_frag = b_read(1, k, b_cur1)
-                rocdl.s_barrier()  # all waves read cur into frags before prefetch overwrites cur (WAR)
-                rocdl.s_setprio(1)
-                accs = mfma.call_iter_asm(a0_frag, a1_frag, b0_frag, b1_frag,
-                                          sa0, sa1, sb0, sb1, accs, N_SUB)
-                rocdl.s_setprio(0)
-                rocdl.s_barrier()  # all waves done ds-reading cur (cluster lgkmcnt-consumed) before overwrite
-                b_g2s.load(b_cur0, B0_off + (k + 2) * B_KSTEP)
-                a_load(a_cur0, A0_off + (k + 2) * KSTEP)
-                b_g2s.load(b_cur1, B1_off + (k + 2) * B_KSTEP)
-                a_load(a_next1, A1_off + (k + 1) * KSTEP)  # asymmetric (required; symmetric worse)
-                wait_barrier(0)  # drain A prefetch
-                a_cur0, a_next0 = a_next0, a_cur0
-                a_cur1, a_next1 = a_next1, a_cur1
-                b_cur0, b_next0 = b_next0, b_cur0
-                b_cur1, b_next1 = b_next1, b_cur1
-                sa0, sa1 = sa0n, sa1n
-                sb0, sb1 = sb0n, sb1n
-                continue
-            if const_expr(interleave):
-                # 4wave-style interleave: per-quadrant wait_barrier + k+2 G2S buffer_loads
-                # spread into the call_one MFMA stream (co-issue -> hides G2S-setup bubble).
-                # FP4_IL_VMC env tunes the per-quadrant vmcnt drain (0 = safest full drain;
-                # raise to leave G2S in flight once det-clean). BN256 bulk only.
-                _ilvmc = const_expr(int(__import__("os").environ.get("FP4_IL_VMC", "0")))
-                sa0n = _sa(sa_base0, k + 1)
-                sb0n, sb1n = _sb(sb_base0, k + 1)
-                sa1n = _sa(sa_base1, k + 1, 1)
-                # c00 (a0xb0); spread a_next1 G2S
-                b0_frag = b_s2r.load(b_cur0)
-                a0_frag = a_s2r.load(a_cur0)
-                wait_barrier(_ilvmc)
-                b1_frag = b_s2r.load(b_cur1)
-                rocdl.s_setprio(1)
-                c00_frag = _quad_il(a0_frag, b0_frag, c00_frag, sa0, sb0,
-                                    [(lambda st=st: a_g2s.load_one(a_next1, A1_off + (k + 1) * KSTEP, st))
-                                     for st in range(N_LDS_STEPS_A)])
-                rocdl.s_setprio(0)
-                # c01 (a0xb1); spread b_cur0(k+2) G2S
-                wait_barrier(_ilvmc)
-                rocdl.s_setprio(1)
-                c01_frag = _quad_il(a0_frag, b1_frag, c01_frag, sa0, sb1,
-                                    [(lambda st=st: b_g2s.load_one(b_cur0, B0_off + (k + 2) * B_KSTEP, st))
-                                     for st in range(N_LDS_STEPS_B)])
-                rocdl.s_setprio(0)
-                # c10 (a1xb0); spread a_cur0(k+2) G2S
-                a1_frag = a_s2r.load(a_cur1)
-                wait_barrier(_ilvmc)
-                rocdl.s_setprio(1)
-                c10_frag = _quad_il(a1_frag, b0_frag, c10_frag, sa1, sb0,
-                                    [(lambda st=st: a_g2s.load_one(a_cur0, A0_off + (k + 2) * KSTEP, st))
-                                     for st in range(N_LDS_STEPS_A)])
-                rocdl.s_setprio(0)
-                # c11 (a1xb1); spread b_cur1(k+2) G2S
-                wait_barrier(_ilvmc)
-                rocdl.s_setprio(1)
-                c11_frag = _quad_il(a1_frag, b1_frag, c11_frag, sa1, sb1,
-                                    [(lambda st=st: b_g2s.load_one(b_cur1, B1_off + (k + 2) * B_KSTEP, st))
-                                     for st in range(N_LDS_STEPS_B)])
-                rocdl.s_setprio(0)
-                a_cur0, a_next0 = a_next0, a_cur0
-                a_cur1, a_next1 = a_next1, a_cur1
-                b_cur0, b_next0 = b_next0, b_cur0
-                b_cur1, b_next1 = b_next1, b_cur1
-                sa0, sa1 = sa0n, sa1n
-                sb0, sb1 = sb0n, sb1n
-                continue
-            sa0n = _sa(sa_base0, k + 1)
-            # FP4_LEANBAR: speed-ceiling probe (aiter has ~8 barriers TOTAL vs our 8/iter).
-            # Strip the 7 plain s_barriers, keep only the 1 vmcnt-drain wait_barrier.
-            # Correctness IGNORED here (measure perf first; fix races only if speed wins).
-            _LEANBAR = const_expr(__import__("os").environ.get("FP4_LEANBAR", "0") == "1")
-
-            b0_frag = b_read(0, k, b_cur0)
-            a0_frag = a_s2r.load(a_cur0)
-            a_load(a_next1, A1_off + (k + 1) * KSTEP)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            # SW-pipeline: issue b_cur1 ds_read INSIDE the c00 region (after the
-            # barrier that guarantees b_cur1's prev-iter write is visible) so its
-            # LDS-read latency overlaps the c00 MFMA (attacks the 34% MFMA-dep
-            # stall). b_cur1 isn't overwritten until the k+2 g2s (4 barriers later).
-            b1_frag = b_read(1, k, b_cur1)
-            rocdl.s_setprio(1)
-            c00_frag = _cs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
-            rocdl.s_setprio(0)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            if const_expr(B_COMB):
-                b_g2s.load(b_cur0, B0_off + (k + 2) * B_KSTEP)
-            sb0n, sb1n = _sb(sb_base0, k + 1)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            rocdl.s_setprio(1)
-            c01_frag = _cs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
-            rocdl.s_setprio(0)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            a1_frag = a_s2r.load(a_cur1)
-            a_load(a_cur0, A0_off + (k + 2) * KSTEP)
-            sa1n = _sa(sa_base1, k + 1, 1)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            rocdl.s_setprio(1)
-            c10_frag = _cs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
-            rocdl.s_setprio(0)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            if const_expr(B_COMB):
-                b_g2s.load(b_cur1, B1_off + (k + 2) * B_KSTEP)
-                if const_expr(not _LEANBAR):
-                    wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
-            else:
-                # BN128 combined k+2 (b_cur0+b_cur1). WAR-safe: b0/b1 reads above are
-                # consumed by the c00/c01/c10 mmas before this overwrite.
-                b_g2s_full.load(b_cur0, B0_off + (k + 2) * B_KSTEP)
-                # r_k7: wait(3) raced (r_k6); try the tightest overlap-allowing drain = 1
-                # outstanding (combined-spill writes nearly fully drained, but A-refills can
-                # overlap). det0-gated: if this races too, the merged-spill needs vmcnt(0)
-                # and pipe-BN128 perf is infeasible (conservative ≈ staged = loses).
-                wait_barrier(1)
-
-            rocdl.s_setprio(1)
-            c11_frag = _cs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
-            rocdl.s_setprio(0)
-            if const_expr(not _LEANBAR):
-                rocdl.s_barrier()
-
-            # FP4_SCHED: gluon LLIR-scheduler mechanism. With LEANBAR (barrier-free body =
-            # one schedulable region), emit sched_group_barrier cadence to interleave the
-            # ds_read (operand LR) EVENLY into the mfma stream -> bury LDS-read latency in
-            # the MFMA shadow (the 4274->5253 gluon lever is exactly this scheduler pass).
-            # totals: mfma = 4*N_ACCUMS*N_SUB; dsrd = 2*(NTA+NTB)*N_SUB (A0/A1 + B0/B1 reads).
-            _SCHED = const_expr(int(__import__("os").environ.get("FP4_SCHED", "0")))
-            if const_expr(_SCHED):  # s_barrier is a runtime barrier; LLVM scheduler can still
-                                    # reorder ds_read across it (no data dep) per the sched groups
-                _nm = 4 * N_ACCUMS * N_SUB
-                _nd = 2 * (N_TILES_A + N_TILES_B) * N_SUB
-                _base = _nm // _nd; _extra = _nm % _nd; _mi = 0
-                for _j in range_constexpr(_nd):
-                    _g = _base + (1 if _j < _extra else 0)
-                    if const_expr(_g > 0):
-                        rocdl.sched_mfma(_g); _mi += _g
-                    rocdl.sched_dsrd(1)
-                if const_expr(_mi < _nm):
-                    rocdl.sched_mfma(_nm - _mi)
-
-            a_cur0, a_next0 = a_next0, a_cur0
-            a_cur1, a_next1 = a_next1, a_cur1
-            b_cur0, b_next0 = b_next0, b_cur0
-            b_cur1, b_next1 = b_next1, b_cur1
-            sa0, sa1 = sa0n, sa1n
-            sb0, sb1 = sb0n, sb1n
-
-        if const_expr(asm_iter):
-            # asm_iter tail: 2 final clusters (KI-2, KI-1), no prefetch; then demux+store.
-            for _kt in range_constexpr(2):
-                kk = (KI - 2) + _kt
-                if const_expr(_ASM_RING):
-                    # A[KI-2],A[KI-1] already in the ring (prefetched by main loop's last
-                    # 2 iters). No prefetch; just read aring[kk%3].
-                    a0_frag = a_s2r.load(aring0[kk % 3])
-                    a1_frag = a_s2r.load(aring1[kk % 3])
-                    b0_frag = bvg.load(0, kk)
-                    b1_frag = bvg.load(1, kk)
+        for k in range_constexpr(K_ITERS - 2):
+            if const_expr(PF_A):
+                if const_expr(DO_COMBINE):
+                    sa0n, sa1n = load_sa_both(k + 1)
                 else:
-                    wait_barrier(0)  # drain prev prefetch BEFORE reads
-                    a0_frag = a_s2r.load(a_cur0)
-                    a1_frag = a_s2r.load(a_cur1)
-                    b0_frag = b_read(0, kk, b_cur0)
-                    b1_frag = b_read(1, kk, b_cur1)
-                    if const_expr(_kt == 0):
-                        a_load(a_next1, A1_off + (KI - 1) * KSTEP)
-                rocdl.s_setprio(1)
-                accs = mfma.call_iter_asm(a0_frag, a1_frag, b0_frag, b1_frag,
-                                          sa0, sa1, sb0, sb1, accs, N_SUB)
-                rocdl.s_setprio(0)
-                rocdl.s_barrier()
-                if const_expr(_kt == 0):
-                    if const_expr(not _ASM_RING):
-                        a_cur0, a_next0 = a_next0, a_cur0
-                        a_cur1, a_next1 = a_next1, a_cur1
-                        b_cur0, b_next0 = b_next0, b_cur0
-                        b_cur1, b_next1 = b_next1, b_cur1
-                    sa0, sa1 = _sa(sa_base0, KI - 1), _sa(sa_base1, KI - 1, 1)
-                    sb0, sb1 = _sb(sb_base0, KI - 1)
-            base_row = block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            store_c.store(accs[0:N_ACCUMS], base_row + 0, base_col + 0)
-            store_c.store(accs[N_ACCUMS:2*N_ACCUMS], base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(accs[2*N_ACCUMS:3*N_ACCUMS], base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(accs[3*N_ACCUMS:4*N_ACCUMS], base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
-        elif const_expr(stage3):
-            # 3-stage tail: last 2 iters (KI-2,KI-1) already in ring (loop's last k+2 G2S).
-            for _kt in range_constexpr(2):
-                kk = (KI - 2) + _kt; rk = kk % 2
-                a0_frag = a_s2r.load(s3_ar0[rk]); a1_frag = a_s2r.load(s3_ar1[rk])
-                b0_frag = b_read(0, kk, s3_br0[rk]); b1_frag = b_read(1, kk, s3_br1[rk])
-                rocdl.s_setprio(1)
-                c00_frag = _cs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
-                c01_frag = _cs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
-                c10_frag = _cs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
-                c11_frag = _cs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
-                rocdl.s_setprio(0)
-                rocdl.s_barrier()
-                if const_expr(_kt == 0):
-                    sa0, sa1 = _sa(sa_base0, KI - 1), _sa(sa_base1, KI - 1, 1)
-                    sb0, sb1 = _sb(sb_base0, KI - 1)
-            base_row = block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
-        else:
-            # Step k = K_ITERS - 2 (prefetch last iter)
-            k = KI - 2
-            sa0n = _sa(sa_base0, KI - 1)
-            sa1n = _sa(sa_base1, KI - 1, 1)
-            sb0n, sb1n = _sb(sb_base0, KI - 1)
-
-            b0_frag = b_read(0, KI - 2, b_cur0)
+                    sa0n = load_sa_region(sa_base0, k + 1)
+            else:
+                if const_expr(DO_COMBINE):
+                    sa0, sa1 = load_sa_both(k)
+                else:
+                    sa0 = load_sa_region(sa_base0, k)
+            if const_expr(not PF_B):
+                sb0, sb1 = load_sb_both(k)
+            b0_frag = b_s2r.load(b_cur0)
             a0_frag = a_s2r.load(a_cur0)
+            a_g2s.load(a_next1, A1_off + (k + 1) * KSTEP)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
-            c00_frag = _cs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
+            c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b1_frag = b_read(1, KI - 2, b_cur1)
+            b1_frag = b_s2r.load(b_cur1)
+            b_g2s.load(b_cur0, B0_off + (k + 2) * KSTEP)
+            if const_expr(PF_B):
+                sb0n, sb1n = load_sb_both(k + 1)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
-            c01_frag = _cs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
+            c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
             a1_frag = a_s2r.load(a_cur1)
-            a_load(a_next1, A1_off + (KI - 1) * KSTEP)
+            a_g2s.load(a_cur0, A0_off + (k + 2) * KSTEP)
+            if const_expr(not DO_COMBINE):
+                if const_expr(PF_A):
+                    sa1n = load_sa_region(sa_base1, k + 1)
+                else:
+                    sa1 = load_sa_region(sa_base1, k)
             rocdl.s_barrier()
 
             rocdl.s_setprio(1)
-            c10_frag = _cs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
+            c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
-            b0_frag = b_read(0, KI - 1, b_next0)
-            rocdl.s_barrier()
+            b_g2s.load(b_cur1, B1_off + (k + 2) * KSTEP)
+            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
 
             rocdl.s_setprio(1)
-            c11_frag = _cs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
+            c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
             rocdl.s_setprio(0)
             rocdl.s_barrier()
 
@@ -4006,42 +3599,119 @@ def compile_mxfp4_gemm_8w(
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
+            if const_expr(PF_A):
+                sa0, sa1 = sa0n, sa1n
+            if const_expr(PF_B):
+                sb0, sb1 = sb0n, sb1n
+
+        # Step k = K_ITERS - 2 (current buffers hold iter K_ITERS-2; tail drains).
+        # When prefetching, sa*/sb* already hold scales[K_ITERS-2]; here prefetch the
+        # LAST iter (K_ITERS-1) scales.
+        k = K_ITERS - 2
+        if const_expr(PF_A):
+            if const_expr(DO_COMBINE):
+                sa0n, sa1n = load_sa_both(K_ITERS - 1)
+            else:
+                sa0n = load_sa_region(sa_base0, K_ITERS - 1)
+                sa1n = load_sa_region(sa_base1, K_ITERS - 1)
+        else:
+            if const_expr(DO_COMBINE):
+                sa0, sa1 = load_sa_both(k)
+            else:
+                sa0 = load_sa_region(sa_base0, k)
+        if const_expr(PF_B):
+            sb0n, sb1n = load_sb_both(K_ITERS - 1)
+        else:
+            sb0, sb1 = load_sb_both(k)
+        b0_frag = b_s2r.load(b_cur0)
+        a0_frag = a_s2r.load(a_cur0)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b1_frag = b_s2r.load(b_cur1)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a1_frag = a_s2r.load(a_cur1)
+        a_g2s.load(a_next1, A1_off + (K_ITERS - 1) * KSTEP)
+        if const_expr(not PF_A and not DO_COMBINE):
+            sa1 = load_sa_region(sa_base1, k)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        b0n_frag = b_s2r.load(b_next0)
+        rocdl.s_barrier()
+
+        rocdl.s_setprio(1)
+        c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
+
+        a_cur0, a_next0 = a_next0, a_cur0
+        a_cur1, a_next1 = a_next1, a_cur1
+        b_cur0, b_next0 = b_next0, b_cur0
+        b_cur1, b_next1 = b_next1, b_cur1
+        if const_expr(PF_A):
             sa0, sa1 = sa0n, sa1n
+        if const_expr(PF_B):
             sb0, sb1 = sb0n, sb1n
 
-            # Step k = K_ITERS - 1
-            k = KI - 1
-            a0_frag = a_s2r.load(a_cur0)
-            wait_barrier(0)
+        # Step k = K_ITERS - 1 (current buffers now hold the last iter; prefetched
+        # operands already hold scales[K_ITERS-1] from the swap above).
+        k = K_ITERS - 1
+        if const_expr(not PF_A):
+            if const_expr(DO_COMBINE):
+                sa0, sa1 = load_sa_both(k)
+            else:
+                sa0 = load_sa_region(sa_base0, k)
+                sa1 = load_sa_region(sa_base1, k)
+        if const_expr(not PF_B):
+            sb0, sb1 = load_sb_both(k)
+        a0_frag = a_s2r.load(a_cur0)
+        b0_frag = b0n_frag
+        wait_barrier(0)
 
-            rocdl.s_setprio(1)
-            c00_frag = _cs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c00_frag = mfma.call_subs(a0_frag, b0_frag, c00_frag, sa0, sb0, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
 
-            b1_frag = b_read(1, KI - 1, b_cur1)
-            rocdl.s_barrier()
+        b1_frag = b_s2r.load(b_cur1)
+        rocdl.s_barrier()
 
-            rocdl.s_setprio(1)
-            c01_frag = _cs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c01_frag = mfma.call_subs(a0_frag, b1_frag, c01_frag, sa0, sb1, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
 
-            a1_frag = a_s2r.load(a_cur1)
-            rocdl.s_barrier()
+        a1_frag = a_s2r.load(a_cur1)
+        rocdl.s_barrier()
 
-            rocdl.s_setprio(1)
-            c10_frag = _cs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
-            c11_frag = _cs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
-            rocdl.s_setprio(0)
-            rocdl.s_barrier()
+        rocdl.s_setprio(1)
+        c10_frag = mfma.call_subs(a1_frag, b0_frag, c10_frag, sa1, sb0, N_SUB)
+        c11_frag = mfma.call_subs(a1_frag, b1_frag, c11_frag, sa1, sb1, N_SUB)
+        rocdl.s_setprio(0)
+        rocdl.s_barrier()
 
-            base_row = block_m * BLOCK_M + wave_m_offset
-            base_col = block_n * BLOCK_N + wave_n_offset
-            store_c.store(c00_frag, base_row + 0, base_col + 0)
-            store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-            store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-            store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        # Store back to gmem (scales already folded into the accumulator by the MMA)
+        base_row = block_m * BLOCK_M + wave_m_offset
+        base_col = block_n * BLOCK_N + wave_n_offset
+        store_c.store(c00_frag, base_row + 0, base_col + 0)
+        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
+        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
+        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
 
     @flyc.jit
     def launch_gemm(
@@ -4055,8 +3725,14 @@ def compile_mxfp4_gemm_8w(
         stream: fx.Stream,
     ):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
-        kernel_gemm_pipe(
-            A, B_T, C, A_scale, B_scale, c_m, c_n,
+        kernel_gemm(
+            A,
+            B_T,
+            C,
+            A_scale,
+            B_scale,
+            c_m,
+            c_n,
             value_attrs={"rocdl.waves_per_eu": 2, "rocdl.flat_work_group_size": "512,512"},
         ).launch(grid=(grid_x, 1, 1), block=(512, 1, 1), stream=stream)
 
